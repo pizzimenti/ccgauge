@@ -30,6 +30,8 @@ Modes (argv[1]):
 
 import json
 import os
+import re
+import subprocess
 import sys
 import time
 import urllib.request
@@ -43,13 +45,44 @@ CACHE = os.path.join(BASE, "usage-cache.json")
 COOLDOWN = os.path.join(BASE, "usage-429-cooldown")
 
 URL = "https://api.anthropic.com/api/oauth/usage"
-UA = "claude-code/2.1.185"
 BETA = "oauth-2025-04-20"
+
+# The User-Agent is load-bearing: the endpoint requires a `claude-code/*` UA or
+# it drops the request into an aggressive rate-limit bucket. We derive the
+# version from the installed CLI at runtime so it tracks Claude Code updates,
+# falling back to this pin if `claude --version` is unavailable.
+DEFAULT_UA = "claude-code/2.1.185"
 
 TTL_SECONDS = 180        # do not refetch within this window (matches safe poll rate)
 COOLDOWN_SECONDS = 600   # back off this long after a 429
+STALE_SECONDS = 1800     # mark the readout as stale (endpoint likely unreachable) past this
 HTTP_TIMEOUT = 6
 WARN_PCT = 80            # at/above this, flag it for the assistant to surface
+
+_UA_CACHE = None
+
+
+def user_agent():
+    """`claude-code/<installed version>`, or DEFAULT_UA if it can't be read.
+
+    Cached per process. `claude --version` prints e.g. '2.1.185 (Claude Code)'.
+    """
+    global _UA_CACHE
+    if _UA_CACHE is not None:
+        return _UA_CACHE
+    ua = DEFAULT_UA
+    try:
+        out = subprocess.run(
+            ["claude", "--version"],
+            capture_output=True, text=True, timeout=5, check=False,
+        ).stdout
+        m = re.search(r"(\d+\.\d+\.\d+)", out)
+        if m:
+            ua = "claude-code/" + m.group(1)
+    except Exception:
+        pass
+    _UA_CACHE = ua
+    return ua
 
 
 # --------------------------------------------------------------------------- #
@@ -110,7 +143,7 @@ def _http_get(token):
         headers={
             "Authorization": "Bearer " + token,
             "anthropic-beta": BETA,
-            "User-Agent": UA,
+            "User-Agent": user_agent(),
             "Accept": "application/json",
         },
         method="GET",
@@ -220,7 +253,11 @@ def cmd_line():
         parts.append(f"session(5h) {p5}% used (resets {r5})")
     if p7 is not None:
         parts.append(f"week(7d) {p7}% used (resets {r7})")
-    line = "[usage] " + " · ".join(parts) + f" [cache {age}s old]"
+    line = "[usage] " + " · ".join(parts)
+    if age > STALE_SECONDS:
+        line += f"  ⚠ STALE: last fetched {age // 60}m ago — usage endpoint may be unreachable"
+    else:
+        line += f" [cache {age}s old]"
     hi = max(x for x in (p5, p7) if x is not None)
     if hi >= WARN_PCT:
         line += f"  ⚠ AT {hi}% — surface this to the user now."
@@ -247,8 +284,12 @@ def cmd_status():
         bits.append(f"{_color(p5)}5h:{p5}%\033[0m")
     if p7 is not None:
         bits.append(f"{_color(p7)}7d:{p7}%\033[0m")
-    if bits:
-        sys.stdout.write(" " + " ".join(bits))
+    if not bits:
+        return
+    age = _now() - c.get("fetched_at", _now())
+    if age > STALE_SECONDS:
+        bits.append("\033[2m?\033[0m")  # dim '?' = cached data is stale
+    sys.stdout.write(" " + " ".join(bits))
 
 
 def cmd_show():
