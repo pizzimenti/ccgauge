@@ -1,0 +1,9 @@
+# ccgauge runtime artifacts (these live in your Claude config dir, never the repo,
+# but ignore them here too in case anyone runs from inside a checkout)
+usage-cache.json
+usage-429-cooldown
+*.bak
+
+# python
+__pycache__/
+*.pyc

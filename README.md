@@ -1,0 +1,184 @@
+# ccgauge
+
+A fuel gauge for your Claude Max plan.
+
+`ccgauge` surfaces the same **5-hour session** and **7-day weekly** usage that
+Claude Code's `/usage` command shows — but continuously, in two places:
+
+- **On your status line**, as a live `5h:11% 7d:3%` readout (colour-coded).
+- **In the assistant's context**, injected each turn via a `UserPromptSubmit`
+  hook, so Claude itself can warn you as you approach a limit.
+
+It reads the OAuth token Claude Code already stores on disk, queries the
+(undocumented) usage endpoint, and caches the result. No API key, no password,
+no browser — and the token never leaves your machine.
+
+```
+~ ctx:10% Opus 4.8 (1M context) 5h:11% 7d:3%
+                                 └──────────┘ ccgauge
+```
+
+## Why
+
+On a subscription plan, the only built-in way to see how much of your rolling
+window you've burned is to stop and type `/usage`. ccgauge makes it ambient:
+you see it without asking, and the assistant can proactively flag it.
+
+## Install
+
+```sh
+git clone https://github.com/pizzimenti/ccgauge ~/Code/ccgauge
+cd ~/Code/ccgauge
+./install.sh
+```
+
+The installer copies `usage.py` and `hooks/usage-line.sh` into your Claude
+config dir (`~/.claude`, or `$CLAUDE_CONFIG_DIR`), and registers the
+`UserPromptSubmit` hook in `settings.json` (idempotently, with a `.bak`
+backup). Then:
+
+1. **Verify:** `python3 ~/.claude/usage.py show`
+2. **Status line:** append the usage fragment to your status line — see
+   [`statusline-snippet.sh`](./statusline-snippet.sh). The one call you add,
+   `python3 ~/.claude/usage.py status`, only reads the cache, so it is safe to
+   run on every render.
+3. **Restart** Claude Code (or start a new session) so the hook loads.
+
+Requires `python3` (standard library only — no `pip install`, no `jq`).
+
+## How it works
+
+A walkthrough from the wire to the glass.
+
+### The data source
+
+```
+GET https://api.anthropic.com/api/oauth/usage
+Authorization: Bearer <accessToken>
+anthropic-beta: oauth-2025-04-20
+User-Agent: claude-code/<version>
+```
+
+Three things make this work:
+
+- **The token** is read from `~/.claude/.credentials.json` →
+  `.claudeAiOauth.accessToken`. It's the OAuth token from your *browser* login,
+  which carries the `user:profile` scope this endpoint requires. (A token from
+  `claude setup-token` has only `user:inference` and will be rejected.)
+- **The `anthropic-beta` header** gates the OAuth API surface.
+- **The `User-Agent`** is load-bearing: without a `claude-code/*` UA you land in
+  an aggressive rate-limit bucket that 429s persistently.
+
+The response is small:
+
+```json
+{"five_hour": {"utilization": 11.0, "resets_at": "2026-06-23T...Z"},
+ "seven_day": {"utilization": 3.0,  "resets_at": "2026-06-28T...Z"}}
+```
+
+`utilization` is a 0–100 float. That's the whole contract.
+
+### One writer, many readers
+
+```
+        api.anthropic.com/api/oauth/usage
+                     ▲  GET, at most every 180s
+                     │
+              ┌──────┴───────┐
+              │   usage.py    │  the ONLY component that touches the
+              │ fetch·cache·  │  network or reads the token
+              │   throttle    │
+              └──────┬───────┘
+                     │ writes
+            ~/.claude/usage-cache.json   ◄── single source of truth
+                     │ reads (no network)
+        ┌────────────┼────────────┐
+   usage.py line  usage.py status  usage.py show
+        │             │              │
+  UserPromptSubmit  status line    on demand
+   hook → context   → terminal
+```
+
+The key decision: **exactly one code path writes; everything else reads a cache
+file.** The status line renders constantly, but reading the cache never hits the
+network — so high-frequency surfaces can't melt the rate limit.
+
+### Rate-limit safety
+
+`usage.py refresh` is a series of cheap early-exits before the expensive call:
+
+1. cache younger than `TTL_SECONDS` (180s) → serve cache, no network
+2. inside a 429 cooldown → serve cache, no network
+3. token missing or about to expire → serve cache
+4. otherwise: `GET` (6s timeout)
+   - `200` → normalise, write cache, clear cooldown
+   - `429` → write a `COOLDOWN_SECONDS` (600s) backoff marker
+   - anything else → leave cache untouched
+
+The cache file's *mtime* is the TTL clock; a tiny `usage-429-cooldown` marker
+file governs backoff. Because 429s here persist and worsen under retries, the
+response to one is to **stop entirely** for the cooldown, not to retry.
+
+### Two display paths
+
+- **Into the assistant's context.** `hooks/usage-line.sh` is a `UserPromptSubmit`
+  hook; Claude Code appends its stdout to the model's context before each turn.
+  The script kicks off a *detached* background refresh (so your prompt never
+  waits on the network) and prints the currently-cached snapshot. Consequence:
+  the number can be one turn stale — fine for a 5-hour window, and worth it for
+  zero latency.
+- **Onto the status line.** `usage.py status` prints a short coloured
+  `5h:X% 7d:Y%` fragment (green < 70, yellow < 90, red ≥ 90), reading only the
+  cache.
+
+### Warning behavior
+
+The hook delivers the *fact*; your `CLAUDE.md` delivers the *policy*. Injected
+hook output is background telemetry, so to have the assistant act on it, add a
+standing note to your `CLAUDE.md`, for example:
+
+> A `UserPromptSubmit` hook injects a `[usage] …` line each turn. When either
+> window is ≥ 80% used, proactively tell me (one line: %, which window, when it
+> resets). Below that, stay silent unless I ask. Do **not** silently change how
+> you work based on the number — I drive `/effort` myself.
+
+`usage.py line` appends an explicit `⚠ AT N%` marker at the 80% threshold to
+make this easy to honor.
+
+## Design properties
+
+| Property | Why |
+| --- | --- |
+| One writer, N readers | High-frequency surfaces never cause network calls. |
+| `mtime` as the TTL clock | No extra state file; survives restarts. |
+| Never throws | A telemetry gadget must never break a hook or status line. Worst case: it shows nothing. |
+| Detached background refresh | Zero prompt latency; accept one-turn staleness. |
+| python3, not jq | `jq` is often missing; python3 is always present, with real JSON + datetime handling. |
+| Secret stays in the worker | The token is read by `usage.py` and used only in the request to Anthropic's own API. The cache holds only percentages and reset times. |
+
+## Failure modes
+
+Every failure degrades to silence, never a crash or a stall:
+
+| Failure | Behavior |
+| --- | --- |
+| Token expired | Serve stale cache; Claude Code refreshes the token during normal use. |
+| 429 rate-limited | Write 600s cooldown, serve stale cache, stop polling. |
+| Network down / timeout | Serve last known cache. |
+| Endpoint removed / header rejected | Cache ages out; `line` prints "unavailable". |
+| Malformed upstream JSON | `line`/`status` print nothing rather than crash. |
+
+## Caveats
+
+This rests on an **undocumented, reverse-engineered endpoint** that Anthropic
+has declined to officially support. It can break on any update. The two most
+likely break points are the hardcoded `User-Agent` version string and the
+`anthropic-beta` date header — if usage stops showing, check those first. The
+whole design is built to degrade silently, so a break costs you a blank readout,
+nothing more.
+
+Not affiliated with or endorsed by Anthropic.
+
+## License
+
+MIT — see [LICENSE](./LICENSE).
