@@ -67,7 +67,9 @@ Three things make this work:
   `claude setup-token` has only `user:inference` and will be rejected.)
 - **The `anthropic-beta` header** gates the OAuth API surface.
 - **The `User-Agent`** is load-bearing: without a `claude-code/*` UA you land in
-  an aggressive rate-limit bucket that 429s persistently.
+  an aggressive rate-limit bucket that 429s persistently. ccgauge derives it from
+  the installed CLI (`claude --version`) at runtime, falling back to a pinned
+  default if that can't be read — so it tracks Claude Code updates automatically.
 
 The response is small:
 
@@ -131,6 +133,11 @@ response to one is to **stop entirely** for the cooldown, not to retry.
   `5h:X% 7d:Y%` fragment (green < 70, yellow < 90, red ≥ 90), reading only the
   cache.
 
+If the cache ever stops updating (e.g. the endpoint becomes unreachable), the
+readout doesn't silently keep showing a frozen number: once data is older than
+`STALE_SECONDS` (30 min), the status line appends a dim `?` and the context line
+says `⚠ STALE: last fetched Nm ago`. Stale is visibly distinct from fresh.
+
 ### Warning behavior
 
 The hook delivers the *fact*; your `CLAUDE.md` delivers the *policy*. Injected
@@ -171,11 +178,11 @@ Every failure degrades to silence, never a crash or a stall:
 ## Caveats
 
 This rests on an **undocumented, reverse-engineered endpoint** that Anthropic
-has declined to officially support. It can break on any update. The two most
-likely break points are the hardcoded `User-Agent` version string and the
-`anthropic-beta` date header — if usage stops showing, check those first. The
-whole design is built to degrade silently, so a break costs you a blank readout,
-nothing more.
+has declined to officially support. It can break on any update. The most likely
+break point is the `anthropic-beta` date header (the `User-Agent` is now derived
+from the installed CLI). If usage goes stale — you'll see the `?` / `⚠ STALE`
+marker — check that header first. The whole design degrades silently, so a break
+costs you a blank or visibly-stale readout, nothing more.
 
 Not affiliated with or endorsed by Anthropic.
 
