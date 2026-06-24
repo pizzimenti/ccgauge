@@ -74,7 +74,7 @@ def user_agent():
     try:
         out = subprocess.run(
             ["claude", "--version"],
-            capture_output=True, text=True, timeout=5,
+            capture_output=True, text=True, timeout=5, check=False,
         ).stdout
         m = re.search(r"(\d+\.\d+\.\d+)", out)
         if m:
