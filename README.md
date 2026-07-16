@@ -138,6 +138,31 @@ readout doesn't silently keep showing a frozen number: once data is older than
 `STALE_SECONDS` (30 min), the status line appends a dim `?` and the context line
 says `⚠ STALE: last fetched Nm ago`. Stale is visibly distinct from fresh.
 
+### Usage history log
+
+Every hook firing and every successful fetch appends one JSON line to
+`~/.claude/usage-log.jsonl`, so you can reconstruct where usage stood, when you
+were prompting, and from which project:
+
+```json
+{"ts": "2026-07-16T14:41:23-07:00", "event": "prompt", "five_hour_pct": 31,
+ "seven_day_pct": 5, "cache_age_s": 308, "cwd": "~/Code/ccgauge", "session_id": "..."}
+```
+
+Three event types: `prompt` (the `UserPromptSubmit` hook fired — one per turn,
+with the cwd and session id Claude Code passes to the hook), `fetch` (new data
+actually landed in the cache), and `cooldown_429` (the endpoint rate-limited
+us — a history of these is how you'd notice UA/header drift). The prompt *text*
+is never logged. View it with:
+
+```sh
+python3 ~/.claude/usage.py log        # last 20 events
+python3 ~/.claude/usage.py log 200    # last 200
+```
+
+The log self-trims (at ~1 MiB it keeps the newest ~4000 events), and — like
+everything else here — a failed write is silent.
+
 ### Warning behavior
 
 The hook delivers the *fact*; your `CLAUDE.md` delivers the *policy*. Injected
@@ -174,6 +199,7 @@ Every failure degrades to silence, never a crash or a stall:
 | Network down / timeout | Serve last known cache. |
 | Endpoint removed / header rejected | Cache ages out; `line` prints "unavailable". |
 | Malformed upstream JSON | `line`/`status` print nothing rather than crash. |
+| History log unwritable | Silent — the readout is unaffected. |
 
 ## Caveats
 
