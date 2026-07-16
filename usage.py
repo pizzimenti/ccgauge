@@ -66,7 +66,7 @@ STALE_SECONDS = 1800     # mark the readout as stale (endpoint likely unreachabl
 HTTP_TIMEOUT = 6
 WARN_PCT = 80            # at/above this, flag it for the assistant to surface
 LOG_MAX_BYTES = 1 << 20  # trim the history log once it outgrows this...
-LOG_KEEP_LINES = 4000    # ...keeping only the newest this-many events
+LOG_KEEP_LINES = 4000    # ...keeping at most this many of the newest events
 
 _UA_CACHE = None
 
@@ -169,6 +169,13 @@ def log_event(event, **fields):
             if fh.tell() > LOG_MAX_BYTES:
                 fh.seek(0)
                 keep = fh.readlines()[-LOG_KEEP_LINES:]
+                # Bound by bytes too: oversized records (e.g. a very long cwd)
+                # could otherwise leave LOG_KEEP_LINES lines still over the
+                # cap, re-triggering this rewrite on every append. Targeting
+                # half the cap gives the same hysteresis in the normal case.
+                total = sum(len(line) for line in keep)
+                while keep and total > LOG_MAX_BYTES // 2:
+                    total -= len(keep.pop(0))
                 fh.seek(0)
                 fh.truncate()
                 fh.writelines(keep)
@@ -282,10 +289,13 @@ def refresh(force=False):
                 json.dump(data, fh)
         except Exception:
             pass
+        else:
+            # only if the write landed: a "fetch" event means the cache (the
+            # single source of truth every reader serves from) really updated
+            log_event("fetch",
+                      five_hour_pct=data.get("five_hour_pct"),
+                      seven_day_pct=data.get("seven_day_pct"))
         clear_cooldown()
-        log_event("fetch",
-                  five_hour_pct=data.get("five_hour_pct"),
-                  seven_day_pct=data.get("seven_day_pct"))
         return data
     if status == 429:
         set_cooldown()
