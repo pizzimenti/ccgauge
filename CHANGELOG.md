@@ -4,6 +4,16 @@ All notable changes to ccgauge are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); this project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.2.0] — 2026-07-16
+
+### Added
+- Usage history log (`~/.claude/usage-log.jsonl`): one JSONL event per hook
+  firing (`prompt`, with the percentages, cache age, cwd, and session id from
+  the hook payload — never the prompt text), per successful fetch (`fetch`),
+  and per rate-limit hit (`cooldown_429`). Self-trims at ~1 MiB to the newest
+  ~4000 events; writes are best-effort and silent on failure.
+- `usage.py log [N]` — human-readable view of the last N events (default 20).
+
 ## [0.1.0] — 2026-06-23
 
 Initial release — an ambient fuel gauge for your Claude Max plan.

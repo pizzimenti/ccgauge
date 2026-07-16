@@ -26,6 +26,7 @@ Modes (argv[1]):
     line                -- one-line snapshot for the UserPromptSubmit hook
     status              -- short coloured fragment for the status line
     show                -- force a synchronous refresh, print a human block
+    log [N]             -- print the last N history events (default 20)
 """
 
 import json
@@ -43,6 +44,7 @@ BASE = os.environ.get("CLAUDE_CONFIG_DIR", os.path.join(HOME, ".claude"))
 CRED = os.path.join(BASE, ".credentials.json")
 CACHE = os.path.join(BASE, "usage-cache.json")
 COOLDOWN = os.path.join(BASE, "usage-429-cooldown")
+LOG = os.path.join(BASE, "usage-log.jsonl")
 
 URL = "https://api.anthropic.com/api/oauth/usage"
 BETA = "oauth-2025-04-20"
@@ -58,6 +60,8 @@ COOLDOWN_SECONDS = 600   # back off this long after a 429
 STALE_SECONDS = 1800     # mark the readout as stale (endpoint likely unreachable) past this
 HTTP_TIMEOUT = 6
 WARN_PCT = 80            # at/above this, flag it for the assistant to surface
+LOG_MAX_BYTES = 1 << 20  # trim the history log once it outgrows this...
+LOG_KEEP_LINES = 4000    # ...keeping only the newest this-many events
 
 _UA_CACHE = None
 
@@ -134,6 +138,47 @@ def clear_cooldown():
         os.remove(COOLDOWN)
     except Exception:
         pass
+
+
+def log_event(event, **fields):
+    """Append one JSONL record to the history log. Best-effort, never raises.
+
+    None-valued fields are dropped. Concurrent appends (foreground `line` +
+    detached `refresh`) may interleave; single short appends are effectively
+    atomic on Linux, and the worst case for the trim race is losing a few of
+    the oldest lines — acceptable for telemetry.
+    """
+    try:
+        rec = {
+            "ts": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
+            "event": event,
+        }
+        rec.update((k, v) for k, v in fields.items() if v is not None)
+        with open(LOG, "a") as fh:
+            fh.write(json.dumps(rec) + "\n")
+        if os.path.getsize(LOG) > LOG_MAX_BYTES:
+            with open(LOG) as fh:
+                lines = fh.readlines()
+            with open(LOG, "w") as fh:
+                fh.writelines(lines[-LOG_KEEP_LINES:])
+    except Exception:
+        pass
+
+
+def _hook_payload():
+    """Parse the JSON Claude Code pipes to a hook's stdin ({} when absent).
+
+    Guarded by isatty so a manual `usage.py line` at a terminal never blocks
+    waiting for input. The prompt text in the payload is never logged.
+    """
+    try:
+        if sys.stdin is not None and not sys.stdin.isatty():
+            raw = sys.stdin.read()
+            if raw.strip():
+                return json.loads(raw)
+    except Exception:
+        pass
+    return {}
 
 
 def _http_get(token):
@@ -227,9 +272,13 @@ def refresh(force=False):
         except Exception:
             pass
         clear_cooldown()
+        log_event("fetch",
+                  five_hour_pct=data.get("five_hour_pct"),
+                  seven_day_pct=data.get("seven_day_pct"))
         return data
     if status == 429:
         set_cooldown()
+        log_event("cooldown_429")
     return read_cache()
 
 
@@ -237,17 +286,26 @@ def refresh(force=False):
 # output modes
 # --------------------------------------------------------------------------- #
 def cmd_line():
+    hook = _hook_payload()
+    cwd = hook.get("cwd")
+    if isinstance(cwd, str) and cwd.startswith(HOME):
+        cwd = "~" + cwd[len(HOME):]
+    session = hook.get("session_id")
     c = read_cache()
     if not c:
+        log_event("prompt", cwd=cwd, session_id=session)
         print("[usage] no data yet (warming up — will populate next turn)")
         return
     p5, p7 = c.get("five_hour_pct"), c.get("seven_day_pct")
     if p5 is None and p7 is None:
+        log_event("prompt", cwd=cwd, session_id=session)
         print("[usage] unavailable")
         return
     r5 = fmt_reset(c.get("five_hour_reset"))
     r7 = fmt_reset(c.get("seven_day_reset"))
     age = int(_now() - c.get("fetched_at", _now()))
+    log_event("prompt", five_hour_pct=p5, seven_day_pct=p7, cache_age_s=age,
+              cwd=cwd, session_id=session)
     parts = []
     if p5 is not None:
         parts.append(f"session(5h) {p5}% used (resets {r5})")
@@ -308,6 +366,34 @@ def cmd_show():
         print(f"  Weekly Opus : {c['seven_day_opus_pct']}% used")
 
 
+def cmd_log():
+    try:
+        n = max(1, int(sys.argv[2]))
+    except (IndexError, ValueError):
+        n = 20
+    try:
+        with open(LOG) as fh:
+            lines = fh.readlines()
+    except Exception:
+        lines = []
+    if not lines:
+        print("usage log: no events recorded yet")
+        return
+    for raw in lines[-n:]:
+        try:
+            r = json.loads(raw)
+        except Exception:
+            continue
+        ts = str(r.get("ts", ""))[:16].replace("T", " ")
+        vals = " ".join(
+            f"{label}:{r[key]}%"
+            for label, key in (("5h", "five_hour_pct"), ("7d", "seven_day_pct"))
+            if r.get(key) is not None
+        )
+        line = f"{ts}  {r.get('event', '?'):<12} {vals:<14} {r.get('cwd', '')}"
+        print(line.rstrip())
+
+
 def main():
     mode = sys.argv[1] if len(sys.argv) > 1 else "refresh"
     try:
@@ -319,6 +405,8 @@ def main():
             cmd_status()
         elif mode == "show":
             cmd_show()
+        elif mode == "log":
+            cmd_log()
     except Exception:
         pass  # never disrupt a hook or status line
     sys.exit(0)
