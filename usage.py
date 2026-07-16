@@ -39,6 +39,11 @@ import urllib.request
 import urllib.error
 from datetime import datetime, timezone
 
+try:
+    import fcntl
+except ImportError:  # non-POSIX: degrade to unlocked best-effort appends
+    fcntl = None
+
 HOME = os.path.expanduser("~")
 BASE = os.environ.get("CLAUDE_CONFIG_DIR", os.path.join(HOME, ".claude"))
 CRED = os.path.join(BASE, ".credentials.json")
@@ -143,10 +148,12 @@ def clear_cooldown():
 def log_event(event, **fields):
     """Append one JSONL record to the history log. Best-effort, never raises.
 
-    None-valued fields are dropped. Concurrent appends (foreground `line` +
-    detached `refresh`) may interleave; single short appends are effectively
-    atomic on Linux, and the worst case for the trim race is losing a few of
-    the oldest lines — acceptable for telemetry.
+    None-valued fields are dropped. The append and any trim run under one
+    exclusive flock on the log fd, and the trim rewrites in place (no rename),
+    so concurrent writers (foreground `line` + detached `refresh`) can neither
+    interleave mid-line nor lose an append that races a trim. The lock is held
+    for at most one ~1 MiB read+write (milliseconds). Without fcntl
+    (non-POSIX) it degrades to unlocked appends.
     """
     try:
         rec = {
@@ -154,13 +161,17 @@ def log_event(event, **fields):
             "event": event,
         }
         rec.update((k, v) for k, v in fields.items() if v is not None)
-        with open(LOG, "a") as fh:
+        with open(LOG, "a+") as fh:
+            if fcntl:
+                fcntl.flock(fh, fcntl.LOCK_EX)  # released when fh closes
             fh.write(json.dumps(rec) + "\n")
-        if os.path.getsize(LOG) > LOG_MAX_BYTES:
-            with open(LOG) as fh:
-                lines = fh.readlines()
-            with open(LOG, "w") as fh:
-                fh.writelines(lines[-LOG_KEEP_LINES:])
+            fh.flush()
+            if fh.tell() > LOG_MAX_BYTES:
+                fh.seek(0)
+                keep = fh.readlines()[-LOG_KEEP_LINES:]
+                fh.seek(0)
+                fh.truncate()
+                fh.writelines(keep)
     except Exception:
         pass
 
@@ -373,6 +384,8 @@ def cmd_log():
         n = 20
     try:
         with open(LOG) as fh:
+            if fcntl:
+                fcntl.flock(fh, fcntl.LOCK_SH)  # don't read mid-trim
             lines = fh.readlines()
     except Exception:
         lines = []
