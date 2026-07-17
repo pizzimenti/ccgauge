@@ -354,8 +354,10 @@ def cmd_line():
                 f"  ⚠ SESSION AT {p5}% — wind down now:"
                 f" (1) offer the user the chance to cue up work for after the reset ({r5});"
                 f" (2) suggest /compact to shrink context before the pause;"
-                f" (3) start `sleep {wake + 60}` in the background (completes ~1m after"
-                f" the reset) and resume the queued work when it fires."
+                f" (3) start `sleep {wake + 60}` as a harness-tracked background task"
+                f" (run_in_background — NOT a detached `&` child, which nothing observes);"
+                f" its completion notification re-invokes you ~1m after the reset —"
+                f" resume the queued work then."
             )
     print(line)
 

@@ -172,9 +172,11 @@ appends a wind-down directive instructing the assistant to:
 
 1. **Queue** — offer you the chance to cue up work for after the reset.
 2. **Compact** — suggest `/compact`, so the post-reset session resumes lean.
-3. **Alarm** — start a detached background `sleep` (the directive supplies
-   the exact duration, computed from the cached `resets_at`) that completes
-   ~1 minute after the window resets, waking the session to pick up the
+3. **Alarm** — start the specified `sleep` (duration computed from the
+   cached `resets_at`, +60s) as a *harness-tracked background task* —
+   Claude Code's `run_in_background` Bash, whose completion notification
+   re-invokes the assistant — not a detached shell child, which nothing
+   observes. The session wakes ~1 minute after the reset and picks up the
    queued work.
 
 The hook delivers the *directive*; your `CLAUDE.md` makes it *policy*. Add a
