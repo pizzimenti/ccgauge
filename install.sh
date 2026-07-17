@@ -66,7 +66,8 @@ ccgauge: done. Next steps:
                         call to your existing status line, or use the example).
   3. Restart Claude Code (or just start a new session) so the hook loads.
 
-The hook injects a [usage] line into the assistant's context each turn. If you
-want the assistant to proactively warn you near a limit, add a short note to
-your CLAUDE.md (see the README's "Warning behavior" section).
+The hook injects a [usage] line into the assistant's context each turn. At 95%
+of the session window it directs the assistant to queue work, compact, and set
+a wake-up alarm — add the standing note from the README's "Wind-down behavior"
+section to your CLAUDE.md so the assistant treats that as policy.
 EOF

@@ -4,6 +4,18 @@ All notable changes to ccgauge are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); this project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.3.0] — 2026-07-16
+
+### Changed
+- Replaced the 80% `⚠ AT N%` warning marker (redundant with Claude Code's
+  native limit warnings) with a wind-down directive at ≥95% of the 5-hour
+  session window. The context line now instructs the assistant to: offer to
+  queue work for after the reset, suggest `/compact` before the pause, and
+  start a background sleep — duration computed from the cached `resets_at` —
+  that wakes the session ~1 minute after the window resets. Suppressed while
+  the cache is stale, since an old percentage may describe an already-reset
+  window.
+
 ## [0.2.0] — 2026-07-16
 
 ### Added
