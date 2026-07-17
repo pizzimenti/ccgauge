@@ -32,7 +32,9 @@ short_cwd="${cwd/#$HOME/\~}"
 # Context-window bar — reuse ccgauge's `bar` so it matches the 5h/7d bars.
 ctx_str=""
 if [ -n "$used_pct" ]; then
-  used_int=$(printf "%.0f" "$used_pct")
+  # LC_NUMERIC=C so printf parses the JSON float (dot decimal) regardless of
+  # the user's locale — a comma-decimal locale would otherwise error on "11.5".
+  used_int=$(LC_NUMERIC=C printf "%.0f" "$used_pct")
   ctx_str=" ctx $(python3 "$USAGE_PY" bar "$used_int" 2>/dev/null) ${used_int}%"
 fi
 

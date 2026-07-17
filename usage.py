@@ -538,7 +538,7 @@ def _bar(pct, cells=10):
         p = max(0.0, min(100.0, float(pct)))
     except (TypeError, ValueError):
         p = 0.0
-    filled = max(0, min(cells, int(round(p / 100 * cells))))
+    filled = max(0, min(cells, round(p / 100 * cells)))
     return "[" + "█" * filled + "░" * (cells - filled) + "]"
 
 
