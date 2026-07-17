@@ -4,6 +4,36 @@ All notable changes to ccgauge are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); this project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.5.0] — 2026-07-17
+
+### Fixed
+- 429 back-off no longer re-arms the lockout. On a rate-limit the fetch now
+  honors the server's `Retry-After` (and `anthropic-ratelimit-*-reset`) header
+  when present; absent that, it backs off exponentially (10m, doubling per
+  consecutive 429, capped at 2h) instead of retrying on a fixed 10-minute
+  clock. A flat retry shorter than the server's penalty kept re-tripping the
+  limit and never let the token's usage bucket drain — a persistent 429 loop.
+
+### Added
+- 10-segment progress bars in the status fragment (one segment per 10%): each
+  value renders as `5h [███░░░░░░░] 31%`, with the percentage shown beside the
+  bar rather than inside it, so the number never occludes a segment.
+- `usage.py bar <pct>` — renders a standalone 0–100 progress bar, so a status
+  line can give Claude Code's own context-window `%` the same bar as 5h/7d.
+- `usage.py status plain` — emits the status fragment with no ANSI, so a
+  status-line snippet can render the whole thing in a single colour of its
+  choosing. The default (coloured, per-window severity) output is unchanged.
+
+### Changed
+- Refetch TTL raised 180s → 600s: this is background telemetry with a low
+  natural request rate, so a longer window means fewer calls against the
+  shared per-token usage budget.
+- Staleness is now stated, not hinted: the cryptic dim `?` marker becomes the
+  word `stale`, and both the context line (`line`) and the human block (`show`)
+  spell out that a stale value is the last successful read and NOT current —
+  including, on `show`, when the endpoint is rate-limited and when the next
+  retry is due. Keeps a frozen readout from being mistaken for a live one.
+
 ## [0.4.0] — 2026-07-17
 
 ### Added
