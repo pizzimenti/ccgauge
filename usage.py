@@ -380,9 +380,14 @@ def _acquire_refresh_lock():
         return _NO_LOCK  # can't create the lock file; don't block refresh
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except Exception:
+    except BlockingIOError:
         fd.close()
-        return None      # another refresh is in flight right now
+        return None      # genuinely contended: another refresh is in flight
+    except OSError:
+        # filesystem doesn't support advisory locks (some NFS/FUSE homes) —
+        # proceed unlocked rather than serve cache forever
+        fd.close()
+        return _NO_LOCK
     return fd
 
 
@@ -425,6 +430,12 @@ def refresh(force=False):
         if in_cooldown():
             # whoever won the lock may have just armed the cooldown; re-check
             return read_cache()
+        if not force:
+            age = cache_age()
+            if age is not None and age < TTL_SECONDS:
+                # a refresh that beat us to the lock already refreshed the
+                # cache; don't fire a now-redundant request
+                return read_cache()
         status, body, retry_after = _http_get(token)
         if status == 200 and body:
             data = normalise(body)
