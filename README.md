@@ -163,19 +163,32 @@ python3 ~/.claude/usage.py log 200    # last 200
 The log self-trims (at ~1 MiB it keeps the newest ~4000 events), and — like
 everything else here — a failed write is silent.
 
-### Warning behavior
+### Wind-down behavior
 
-The hook delivers the *fact*; your `CLAUDE.md` delivers the *policy*. Injected
-hook output is background telemetry, so to have the assistant act on it, add a
-standing note to your `CLAUDE.md`, for example:
+Claude Code already warns natively as you approach a limit, so a bare
+"you're at N%" from ccgauge would be redundant. Instead, once the **session
+(5h) window reaches 95%** (and the cached data is fresh), `usage.py line`
+appends a wind-down directive instructing the assistant to:
 
-> A `UserPromptSubmit` hook injects a `[usage] …` line each turn. When either
-> window is ≥ 80% used, proactively tell me (one line: %, which window, when it
-> resets). Below that, stay silent unless I ask. Do **not** silently change how
-> you work based on the number — I drive `/effort` myself.
+1. **Queue** — offer you the chance to cue up work for after the reset.
+2. **Compact** — suggest `/compact`, so the post-reset session resumes lean.
+3. **Alarm** — start a detached background `sleep` (the directive supplies
+   the exact duration, computed from the cached `resets_at`) that completes
+   ~1 minute after the window resets, waking the session to pick up the
+   queued work.
 
-`usage.py line` appends an explicit `⚠ AT N%` marker at the 80% threshold to
-make this easy to honor.
+The hook delivers the *directive*; your `CLAUDE.md` makes it *policy*. Add a
+standing note, for example:
+
+> A `UserPromptSubmit` hook injects a `[usage] …` line each turn. Below 95%
+> it is background telemetry — stay quiet about it unless I ask, and do
+> **not** silently change how you work based on the number. When the line
+> carries a `⚠ SESSION AT N% — wind down` directive, follow its three steps:
+> offer to queue work for after the reset, suggest `/compact`, and start the
+> background sleep it specifies, resuming the queued work when it fires.
+
+The directive is suppressed while the cache is stale — an old percentage may
+describe a window that has already reset.
 
 ## Design properties
 

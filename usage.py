@@ -64,7 +64,7 @@ TTL_SECONDS = 180        # do not refetch within this window (matches safe poll 
 COOLDOWN_SECONDS = 600   # back off this long after a 429
 STALE_SECONDS = 1800     # mark the readout as stale (endpoint likely unreachable) past this
 HTTP_TIMEOUT = 6
-WARN_PCT = 80            # at/above this, flag it for the assistant to surface
+ACT_PCT = 95             # session window at/above this: inject wind-down directive
 LOG_MAX_BYTES = 1 << 20  # trim the history log once it outgrows this...
 LOG_KEEP_LINES = 4000    # ...keeping at most this many of the newest events
 
@@ -250,19 +250,26 @@ def read_cache():
         return None
 
 
-def fmt_reset(iso):
-    """ISO timestamp -> 'in 4h 1m' (or '' on failure)."""
+def _secs_until(iso):
+    """Seconds from now until an ISO timestamp, or None on failure."""
     if not iso:
-        return ""
+        return None
     try:
         dt = datetime.fromisoformat(str(iso).replace("Z", "+00:00"))
-        secs = int((dt - datetime.now(timezone.utc)).total_seconds())
-        if secs <= 0:
-            return "now"
-        h, m = secs // 3600, (secs % 3600) // 60
-        return f"in {h}h {m}m" if h else f"in {m}m"
+        return int((dt - datetime.now(timezone.utc)).total_seconds())
     except Exception:
+        return None
+
+
+def fmt_reset(iso):
+    """ISO timestamp -> 'in 4h 1m' (or '' on failure)."""
+    secs = _secs_until(iso)
+    if secs is None:
         return ""
+    if secs <= 0:
+        return "now"
+    h, m = secs // 3600, (secs % 3600) // 60
+    return f"in {h}h {m}m" if h else f"in {m}m"
 
 
 # --------------------------------------------------------------------------- #
@@ -337,9 +344,19 @@ def cmd_line():
         line += f"  ⚠ STALE: last fetched {age // 60}m ago — usage endpoint may be unreachable"
     else:
         line += f" [cache {age}s old]"
-    hi = max(x for x in (p5, p7) if x is not None)
-    if hi >= WARN_PCT:
-        line += f"  ⚠ AT {hi}% — surface this to the user now."
+        # Claude Code already warns natively near a limit, so a bare "at N%"
+        # marker is redundant. At ACT_PCT on the session window we instead
+        # hand the assistant a wind-down protocol. Suppressed while stale:
+        # an old percentage may describe a window that has already reset.
+        wake = _secs_until(c.get("five_hour_reset"))
+        if p5 is not None and p5 >= ACT_PCT and wake is not None and wake > 0:
+            line += (
+                f"  ⚠ SESSION AT {p5}% — wind down now:"
+                f" (1) offer the user the chance to cue up work for after the reset ({r5});"
+                f" (2) suggest /compact to shrink context before the pause;"
+                f" (3) start `sleep {wake + 60}` in the background (completes ~1m after"
+                f" the reset) and resume the queued work when it fires."
+            )
     print(line)
 
 
