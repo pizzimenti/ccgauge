@@ -30,6 +30,7 @@ Modes (argv[1]):
 """
 
 import json
+import math
 import os
 import re
 import subprocess
@@ -382,13 +383,15 @@ def cmd_status():
         frag = f"{_color(p5)}5h:{p5}%\033[0m"
         s5 = _secs_until(c.get("five_hour_reset"))
         if s5 is not None and s5 > 0:
-            frag += f"\033[2m({s5 / 3600:.1f}h)\033[0m"
+            # ceil to one decimal: a live countdown must never show 0.0
+            # (nor understate the wait) while the window is still limiting
+            frag += f"\033[2m({math.ceil(s5 / 360) / 10:.1f}h)\033[0m"
         bits.append(frag)
     if p7 is not None:
         frag = f"{_color(p7)}7d:{p7}%\033[0m"
         s7 = _secs_until(c.get("seven_day_reset"))
         if s7 is not None and s7 > 0:
-            frag += f"\033[2m({s7 / 86400:.1f}d)\033[0m"
+            frag += f"\033[2m({math.ceil(s7 / 8640) / 10:.1f}d)\033[0m"
         bits.append(frag)
     if not bits:
         return
