@@ -5,7 +5,8 @@ A fuel gauge for your Claude Max plan.
 `ccgauge` surfaces the same **5-hour session** and **7-day weekly** usage that
 Claude Code's `/usage` command shows — but continuously, in two places:
 
-- **On your status line**, as a live `5h:11% 7d:3%` readout (colour-coded).
+- **On your status line**, as a live `5h:11%(3.7h) 7d:3%(5.2d)` readout —
+  colour-coded utilization with a countdown to each window's reset.
 - **In the assistant's context**, injected each turn via a `UserPromptSubmit`
   hook, so Claude itself can warn you as you approach a limit.
 
@@ -14,8 +15,8 @@ It reads the OAuth token Claude Code already stores on disk, queries the
 no browser — and the token never leaves your machine.
 
 ```
-~ ctx:10% Opus 4.8 (1M context) 5h:11% 7d:3%
-                                 └──────────┘ ccgauge
+~ ctx:10% Opus 4.8 (1M context) 5h:11%(3.7h) 7d:3%(5.2d)
+                                 └──────────────────────┘ ccgauge
 ```
 
 ## Why
@@ -130,8 +131,9 @@ response to one is to **stop entirely** for the cooldown, not to retry.
   the number can be one turn stale — fine for a 5-hour window, and worth it for
   zero latency.
 - **Onto the status line.** `usage.py status` prints a short coloured
-  `5h:X% 7d:Y%` fragment (green < 70, yellow < 90, red ≥ 90), reading only the
-  cache.
+  `5h:X%(X.Yh) 7d:Y%(X.Yd)` fragment — utilization colour-coded (green < 70,
+  yellow < 90, red ≥ 90), each followed by a dim countdown to that window's
+  reset — reading only the cache.
 
 If the cache ever stops updating (e.g. the endpoint becomes unreachable), the
 readout doesn't silently keep showing a frozen number: once data is older than
