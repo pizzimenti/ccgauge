@@ -16,15 +16,20 @@ Response shape:
      "seven_day": {"utilization": 26.0, "resets_at": "...Z"}, ...}
 
 Design constraints:
-  * The endpoint 429s hard if polled too fast -> only fetch when the cache
-    is older than TTL_SECONDS, and back off COOLDOWN_SECONDS after any 429.
+  * The endpoint 429s hard if polled too fast -> only fetch when the cache is
+    older than TTL_SECONDS. After a 429, honor the server's Retry-After header
+    when present; otherwise back off exponentially (BACKOFF_BASE, doubling per
+    consecutive 429, capped at BACKOFF_CAP) so we stop knocking long enough for
+    the token's usage bucket to drain instead of re-arming the lockout.
   * Never raise: every command path swallows errors and exits 0 so this can
     never disrupt a hook or the status line.
 
 Modes (argv[1]):
     refresh  (default) -- fetch only if cache is stale & not in cooldown
     line                -- one-line snapshot for the UserPromptSubmit hook
-    status              -- short coloured fragment for the status line
+    status [plain]      -- short fragment (5h/7d bars) for the status line;
+                           `plain` drops ANSI so the caller owns the colour
+    bar <pct>           -- a standalone 0-100 progress bar (e.g. for context %)
     show                -- force a synchronous refresh, print a human block
     log [N]             -- print the last N history events (default 20)
 """
@@ -51,6 +56,7 @@ CRED = os.path.join(BASE, ".credentials.json")
 CACHE = os.path.join(BASE, "usage-cache.json")
 COOLDOWN = os.path.join(BASE, "usage-429-cooldown")
 LOG = os.path.join(BASE, "usage-log.jsonl")
+LOCK = os.path.join(BASE, "usage-refresh.lock")
 
 URL = "https://api.anthropic.com/api/oauth/usage"
 BETA = "oauth-2025-04-20"
@@ -61,8 +67,10 @@ BETA = "oauth-2025-04-20"
 # falling back to this pin if `claude --version` is unavailable.
 DEFAULT_UA = "claude-code/2.1.185"
 
-TTL_SECONDS = 180        # do not refetch within this window (matches safe poll rate)
-COOLDOWN_SECONDS = 600   # back off this long after a 429
+TTL_SECONDS = 600        # do not refetch within this window (background telemetry: low request rate)
+BACKOFF_BASE = 600       # first 429 backs off this long (fallback when no Retry-After header)...
+BACKOFF_CAP = 7200       # ...doubling per consecutive 429, capped here (2h) so the token's usage
+                         # bucket can actually drain instead of us re-arming the server-side lockout
 STALE_SECONDS = 1800     # mark the readout as stale (endpoint likely unreachable) past this
 HTTP_TIMEOUT = 6
 ACT_PCT = 95             # session window at/above this: inject wind-down directive
@@ -123,20 +131,53 @@ def cache_age():
         return None
 
 
-def in_cooldown():
+def _read_cooldown():
+    """Return (until_epoch, consecutive_429_count); (0.0, 0) if absent/unreadable.
+
+    The cooldown file is JSON ({"until": <epoch>, "consecutive": <n>}); a bare
+    float is tolerated so a file written by an older version still parses.
+    """
     try:
         with open(COOLDOWN) as fh:
-            return float(fh.read().strip()) > _now()
+            raw = fh.read().strip()
     except Exception:
-        return False
+        return 0.0, 0
+    try:
+        data = json.loads(raw)
+        return float(data.get("until", 0)), int(data.get("consecutive", 0))
+    except Exception:
+        try:
+            return float(raw), 0
+        except Exception:
+            return 0.0, 0
 
 
-def set_cooldown():
+def in_cooldown():
+    until, _ = _read_cooldown()
+    return until > _now()
+
+
+def set_cooldown(retry_after=None):
+    """Arm the 429 back-off and return the chosen delay in seconds.
+
+    Honors the server's Retry-After (retry_after, in seconds) when provided so we
+    wait exactly as long as the endpoint asks; otherwise backs off exponentially
+    on the consecutive-429 count. Either way the consecutive counter advances, so
+    a run of header-less 429s keeps stretching the wait instead of knocking every
+    fixed interval and re-arming the server-side lockout.
+    """
+    _, prev = _read_cooldown()
+    consecutive = prev + 1
+    if retry_after and retry_after > 0:
+        delay = max(int(retry_after), 60)          # trust the server; floor at 60s
+    else:
+        delay = min(BACKOFF_BASE * (2 ** (consecutive - 1)), BACKOFF_CAP)
     try:
         with open(COOLDOWN, "w") as fh:
-            fh.write(str(_now() + COOLDOWN_SECONDS))
+            json.dump({"until": _now() + delay, "consecutive": consecutive}, fh)
     except Exception:
         pass
+    return delay
 
 
 def clear_cooldown():
@@ -200,8 +241,52 @@ def _hook_payload():
     return {}
 
 
+def _retry_after_seconds(err):
+    """Back-off duration (seconds) parsed from a 429's headers, or None.
+
+    Prefers the standard `Retry-After` (delta-seconds or an HTTP-date), then
+    falls back to Anthropic's `anthropic-ratelimit-*-reset` (epoch or ISO time).
+    """
+    try:
+        hdrs = err.headers
+    except Exception:
+        hdrs = None
+    if not hdrs:
+        return None
+    ra = hdrs.get("retry-after")
+    if ra:
+        ra = ra.strip()
+        if ra.isdigit():
+            return int(ra)
+        try:
+            from email.utils import parsedate_to_datetime
+            dt = parsedate_to_datetime(ra)
+            if dt is not None:
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                return max(0, int((dt - datetime.now(timezone.utc)).total_seconds()))
+        except Exception:
+            pass
+    for key in ("anthropic-ratelimit-unified-reset",
+                "anthropic-ratelimit-unified-5h-reset",
+                "anthropic-ratelimit-requests-reset",
+                "anthropic-ratelimit-tokens-reset"):
+        val = hdrs.get(key)
+        if not val:
+            continue
+        val = val.strip()
+        if val.isdigit():
+            secs = int(val) - int(_now())
+            if secs > 0:
+                return secs
+        secs = _secs_until(val)
+        if secs and secs > 0:
+            return secs
+    return None
+
+
 def _http_get(token):
-    """Return (status_code_or_None, body_dict_or_None)."""
+    """Return (status_code_or_None, body_dict_or_None, retry_after_seconds_or_None)."""
     req = urllib.request.Request(
         URL,
         headers={
@@ -214,11 +299,11 @@ def _http_get(token):
     )
     try:
         with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
-            return resp.status, json.load(resp)
+            return resp.status, json.load(resp), None
     except urllib.error.HTTPError as e:
-        return e.code, None
+        return e.code, None, _retry_after_seconds(e)
     except Exception:
-        return None, None
+        return None, None, None
 
 
 def _pct(window):
@@ -276,6 +361,49 @@ def fmt_reset(iso):
 # --------------------------------------------------------------------------- #
 # core
 # --------------------------------------------------------------------------- #
+_NO_LOCK = object()  # sentinel: proceed with refresh but without a real lock
+
+
+def _acquire_refresh_lock():
+    """Grab the cross-process refresh lock, non-blocking.
+
+    Returns the held lock fd on success; None if another refresh already holds
+    it (the caller should serve cache rather than fire a duplicate request); the
+    _NO_LOCK sentinel when fcntl is unavailable, so refresh proceeds unlocked
+    exactly as it did before locking existed.
+    """
+    if not fcntl:
+        return _NO_LOCK
+    try:
+        fd = open(LOCK, "w")
+    except Exception:
+        return _NO_LOCK  # can't create the lock file; don't block refresh
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        fd.close()
+        return None      # genuinely contended: another refresh is in flight
+    except OSError:
+        # filesystem doesn't support advisory locks (some NFS/FUSE homes) —
+        # proceed unlocked rather than serve cache forever
+        fd.close()
+        return _NO_LOCK
+    return fd
+
+
+def _release_refresh_lock(handle):
+    if handle is _NO_LOCK:
+        return
+    try:
+        fcntl.flock(handle, fcntl.LOCK_UN)
+    except Exception:
+        pass
+    try:
+        handle.close()
+    except Exception:
+        pass
+
+
 def refresh(force=False):
     if not force:
         age = cache_age()
@@ -289,26 +417,48 @@ def refresh(force=False):
     if exp_s and exp_s < _now() + 30:
         # token is expired or about to expire; let Claude Code refresh it
         return read_cache()
-    status, body = _http_get(token)
-    if status == 200 and body:
-        data = normalise(body)
-        try:
-            with open(CACHE, "w") as fh:
-                json.dump(data, fh)
-        except Exception:
-            pass
-        else:
-            # only if the write landed: a "fetch" event means the cache (the
-            # single source of truth every reader serves from) really updated
-            log_event("fetch",
-                      five_hour_pct=data.get("five_hour_pct"),
-                      seven_day_pct=data.get("seven_day_pct"))
-        clear_cooldown()
-        return data
-    if status == 429:
-        set_cooldown()
-        log_event("cooldown_429")
-    return read_cache()
+    # Serialize the fetch+cooldown update across processes. Two overlapping
+    # UserPromptSubmit hooks each spawn a detached refresh, and both can clear
+    # in_cooldown() above before either fires — without this guard they double-
+    # hit the endpoint and, reading the same consecutive-429 count, fail to
+    # escalate the backoff. A non-blocking lock means the refresh that loses the
+    # race serves cache instead of sending a duplicate request.
+    lock = _acquire_refresh_lock()
+    if lock is None:
+        return read_cache()
+    try:
+        if in_cooldown():
+            # whoever won the lock may have just armed the cooldown; re-check
+            return read_cache()
+        if not force:
+            age = cache_age()
+            if age is not None and age < TTL_SECONDS:
+                # a refresh that beat us to the lock already refreshed the
+                # cache; don't fire a now-redundant request
+                return read_cache()
+        status, body, retry_after = _http_get(token)
+        if status == 200 and body:
+            data = normalise(body)
+            try:
+                with open(CACHE, "w") as fh:
+                    json.dump(data, fh)
+            except Exception:
+                pass
+            else:
+                # only if the write landed: a "fetch" event means the cache (the
+                # single source of truth every reader serves from) really updated
+                log_event("fetch",
+                          five_hour_pct=data.get("five_hour_pct"),
+                          seven_day_pct=data.get("seven_day_pct"))
+            clear_cooldown()
+            return data
+        if status == 429:
+            delay = set_cooldown(retry_after)
+            log_event("cooldown_429", backoff_s=int(delay),
+                      retry_after=int(retry_after) if retry_after else None)
+        return read_cache()
+    finally:
+        _release_refresh_lock(lock)
 
 
 # --------------------------------------------------------------------------- #
@@ -335,14 +485,19 @@ def cmd_line():
     age = int(_now() - c.get("fetched_at", _now()))
     log_event("prompt", five_hour_pct=p5, seven_day_pct=p7, cache_age_s=age,
               cwd=cwd, session_id=session)
+    stale = age > STALE_SECONDS
     parts = []
     if p5 is not None:
-        parts.append(f"session(5h) {p5}% used (resets {r5})")
+        parts.append(f"session(5h) last-known {p5}% (NOT live)" if stale
+                     else f"session(5h) {p5}% used (resets {r5})")
     if p7 is not None:
-        parts.append(f"week(7d) {p7}% used (resets {r7})")
+        parts.append(f"week(7d) last-known {p7}% (NOT live)" if stale
+                     else f"week(7d) {p7}% used (resets {r7})")
     line = "[usage] " + " · ".join(parts)
-    if age > STALE_SECONDS:
-        line += f"  ⚠ STALE: last fetched {age // 60}m ago — usage endpoint may be unreachable"
+    if stale:
+        line += (f"  ⚠ STALE {age // 60}m — endpoint unreachable/rate-limited."
+                 f" The values above are the last successful read, NOT current;"
+                 f" do not trust them. Run `/usage` in-app for live numbers.")
     else:
         line += f" [cache {age}s old]"
         # Claude Code already warns natively near a limit, so a bare "at N%"
@@ -373,32 +528,56 @@ def _color(pct):
     return "\033[0;32m"       # green
 
 
-def cmd_status():
+def _bar(pct, cells=10):
+    """A `cells`-segment progress bar — one filled segment per (100/cells)%, so
+    10 cells = 10% each: `[░░░░░░░░░░]` at 0, `[██░░░░░░░░]` at ~20, `[██████████]`
+    at 100. The percentage is deliberately NOT drawn inside the bar (it would
+    occlude segments) — render the number alongside it.
+    """
+    try:
+        p = max(0.0, min(100.0, float(pct)))
+    except (TypeError, ValueError):
+        p = 0.0
+    filled = max(0, min(cells, round(p / 100 * cells)))
+    return "[" + "█" * filled + "░" * (cells - filled) + "]"
+
+
+def cmd_status(plain=False):
     c = read_cache()
     if not c:
         return
     p5, p7 = c.get("five_hour_pct"), c.get("seven_day_pct")
-    bits = []
-    if p5 is not None:
-        frag = f"{_color(p5)}5h:{p5}%\033[0m"
-        s5 = _secs_until(c.get("five_hour_reset"))
-        if s5 is not None and s5 > 0:
+
+    # In plain mode emit NO ANSI: the caller (e.g. a status-line snippet) owns
+    # the color and can render the whole fragment in one hue. The default keeps
+    # the per-window severity colors (green/yellow/red) for standalone use.
+    def seg(label, pct, reset_iso, unit, denom):
+        core = f"{label} {_bar(pct)} {pct}%"
+        frag = core if plain else f"{_color(pct)}{core}\033[0m"
+        secs = _secs_until(reset_iso)
+        if secs is not None and secs > 0:
             # ceil to one decimal: a live countdown must never show 0.0
             # (nor understate the wait) while the window is still limiting
-            frag += f"\033[2m({math.ceil(s5 / 360) / 10:.1f}h)\033[0m"
-        bits.append(frag)
+            span = f"({math.ceil(secs / denom) / 10:.1f}{unit})"
+            frag += span if plain else f"\033[2m{span}\033[0m"
+        return frag
+
+    bits = []
+    if p5 is not None:
+        bits.append(seg("5h", p5, c.get("five_hour_reset"), "h", 360))
     if p7 is not None:
-        frag = f"{_color(p7)}7d:{p7}%\033[0m"
-        s7 = _secs_until(c.get("seven_day_reset"))
-        if s7 is not None and s7 > 0:
-            frag += f"\033[2m({math.ceil(s7 / 8640) / 10:.1f}d)\033[0m"
-        bits.append(frag)
+        bits.append(seg("7d", p7, c.get("seven_day_reset"), "d", 8640))
     if not bits:
         return
     age = _now() - c.get("fetched_at", _now())
     if age > STALE_SECONDS:
-        bits.append("\033[2m?\033[0m")  # dim '?' = cached data is stale
-    sys.stdout.write(" " + " ".join(bits))
+        # A clear word beats the old cryptic '?': this fragment is the last
+        # successful read, NOT live, whenever the endpoint is unreachable.
+        bits.append("stale" if plain else "\033[2mstale\033[0m")
+    if plain:
+        sys.stdout.write(" · ".join(bits))
+    else:
+        sys.stdout.write(" " + " ".join(bits))
 
 
 def cmd_show():
@@ -410,11 +589,24 @@ def cmd_show():
             print("usage: unavailable (no token, expired token, or endpoint error)")
         return
     p5, p7 = c.get("five_hour_pct"), c.get("seven_day_pct")
+    age = int(_now() - c.get("fetched_at", _now()))
     print("Claude subscription usage")
     print(f"  Session (5h): {p5}% used — resets {fmt_reset(c.get('five_hour_reset'))}")
     print(f"  Weekly  (7d): {p7}% used — resets {fmt_reset(c.get('seven_day_reset'))}")
     if c.get("seven_day_opus_pct") is not None:
         print(f"  Weekly Opus : {c['seven_day_opus_pct']}% used")
+    # Be honest when the forced refresh could NOT reach the endpoint: a live
+    # `show` that silently returns hour-old cache is exactly how a stale 0% gets
+    # mistaken for current. Flag the cache age and any active back-off.
+    if age > STALE_SECONDS or in_cooldown():
+        until, consec = _read_cooldown()
+        wait = int(until - _now())
+        note = f"  ⚠ NOT live — cached {age // 60}m ago"
+        if in_cooldown() and wait > 0:
+            note += (f"; endpoint rate-limited, next retry in "
+                     f"{wait // 60}m{wait % 60:02d}s (after {consec} consecutive 429s)")
+        note += ". Check `/usage` in-app for current numbers."
+        print(note)
 
 
 def cmd_log():
@@ -455,7 +647,16 @@ def main():
         elif mode == "line":
             cmd_line()
         elif mode == "status":
-            cmd_status()
+            cmd_status(plain=(len(sys.argv) > 2 and sys.argv[2] == "plain"))
+        elif mode == "bar":
+            # Render a standalone progress bar for an arbitrary 0-100 value, so
+            # callers (e.g. a status line showing Claude Code's own context %)
+            # can reuse the exact same bar as the 5h/7d fragments.
+            if len(sys.argv) > 2:
+                try:
+                    sys.stdout.write(_bar(float(sys.argv[2])))
+                except ValueError:
+                    pass
         elif mode == "show":
             cmd_show()
         elif mode == "log":

@@ -5,8 +5,10 @@ A fuel gauge for your Claude Max plan.
 `ccgauge` surfaces the same **5-hour session** and **7-day weekly** usage that
 Claude Code's `/usage` command shows — but continuously, in two places:
 
-- **On your status line**, as a live `5h:11%(3.7h) 7d:3%(5.2d)` readout —
-  colour-coded utilization with a countdown to each window's reset.
+- **On your status line**, as a live
+  `5h [█░░░░░░░░░] 11%(3.7h) 7d [░░░░░░░░░░] 3%(5.2d)` readout — a 10-segment
+  progress bar per window with the percentage beside it, colour-coded, and a
+  countdown to each window's reset.
 - **In the assistant's context**, injected each turn via a `UserPromptSubmit`
   hook, so Claude itself can warn you as you approach a limit.
 
@@ -15,8 +17,8 @@ It reads the OAuth token Claude Code already stores on disk, queries the
 no browser — and the token never leaves your machine.
 
 ```
-~ ctx:10% Opus 4.8 (1M context) 5h:11%(3.7h) 7d:3%(5.2d)
-                                 └──────────────────────┘ ccgauge
+~ ctx:10% Opus 4.8 (1M context) 5h [█░░░░░░░░░] 11%(3.7h) 7d [░░░░░░░░░░] 3%(5.2d)
+                                 └──────────────────────────────────────────────┘ ccgauge
 ```
 
 ## Why
@@ -85,7 +87,7 @@ The response is small:
 
 ```
         api.anthropic.com/api/oauth/usage
-                     ▲  GET, at most every 180s
+                     ▲  GET, at most every 600s
                      │
               ┌──────┴───────┐
               │   usage.py    │  the ONLY component that touches the
@@ -110,17 +112,23 @@ network — so high-frequency surfaces can't melt the rate limit.
 
 `usage.py refresh` is a series of cheap early-exits before the expensive call:
 
-1. cache younger than `TTL_SECONDS` (180s) → serve cache, no network
+1. cache younger than `TTL_SECONDS` (600s) → serve cache, no network
 2. inside a 429 cooldown → serve cache, no network
 3. token missing or about to expire → serve cache
 4. otherwise: `GET` (6s timeout)
    - `200` → normalise, write cache, clear cooldown
-   - `429` → write a `COOLDOWN_SECONDS` (600s) backoff marker
+   - `429` → write a backoff marker — its duration is the server's `Retry-After`
+     (or `anthropic-ratelimit-*-reset`) header when present, else an exponential
+     backoff (`BACKOFF_BASE` 600s, doubling per consecutive 429, capped at
+     `BACKOFF_CAP` 2h)
    - anything else → leave cache untouched
 
 The cache file's *mtime* is the TTL clock; a tiny `usage-429-cooldown` marker
-file governs backoff. Because 429s here persist and worsen under retries, the
-response to one is to **stop entirely** for the cooldown, not to retry.
+(JSON: the backoff-until time and a consecutive-429 count) governs backoff.
+Because 429s here persist and *worsen* under retries — a fixed short retry keeps
+re-arming the lockout, so the token's usage bucket never drains — the response
+is to wait out the server's stated cooldown, and to back off exponentially when
+it states none, rather than retry on a fixed clock.
 
 ### Two display paths
 
@@ -131,14 +139,19 @@ response to one is to **stop entirely** for the cooldown, not to retry.
   the number can be one turn stale — fine for a 5-hour window, and worth it for
   zero latency.
 - **Onto the status line.** `usage.py status` prints a short coloured
-  `5h:X%(X.Yh) 7d:Y%(X.Yd)` fragment — utilization colour-coded (green < 70,
-  yellow < 90, red ≥ 90), each followed by a dim countdown to that window's
-  reset — reading only the cache.
+  `5h [█░░░░░░░░░] 11%(3.7h) 7d [░░░░░░░░░░] 3%(5.2d)` fragment — a 10-segment
+  progress bar per window (one segment per 10%) with the percentage beside it,
+  colour-coded (green < 70, yellow < 90, red ≥ 90) and each followed by a dim
+  countdown to that window's reset — reading only the cache. `usage.py status
+  plain` emits the same fragment without ANSI (for a snippet that paints it one
+  colour), and `usage.py bar <pct>` renders a standalone bar for any 0–100 value
+  — handy for giving Claude Code's own context-window `%` the same treatment.
 
 If the cache ever stops updating (e.g. the endpoint becomes unreachable), the
 readout doesn't silently keep showing a frozen number: once data is older than
-`STALE_SECONDS` (30 min), the status line appends a dim `?` and the context line
-says `⚠ STALE: last fetched Nm ago`. Stale is visibly distinct from fresh.
+`STALE_SECONDS` (30 min), the status line appends the word `stale` and the
+context line spells out that the shown values are the last successful read and
+NOT current. Stale is visibly distinct from fresh.
 
 ### Usage history log
 
@@ -212,7 +225,7 @@ Every failure degrades to silence, never a crash or a stall:
 | Failure | Behavior |
 | --- | --- |
 | Token expired | Serve stale cache; Claude Code refreshes the token during normal use. |
-| 429 rate-limited | Write 600s cooldown, serve stale cache, stop polling. |
+| 429 rate-limited | Honor `Retry-After` (else exponential backoff, capped 2h), serve stale cache, stop polling until it clears. |
 | Network down / timeout | Serve last known cache. |
 | Endpoint removed / header rejected | Cache ages out; `line` prints "unavailable". |
 | Malformed upstream JSON | `line`/`status` print nothing rather than crash. |
@@ -223,7 +236,7 @@ Every failure degrades to silence, never a crash or a stall:
 This rests on an **undocumented, reverse-engineered endpoint** that Anthropic
 has declined to officially support. It can break on any update. The most likely
 break point is the `anthropic-beta` date header (the `User-Agent` is now derived
-from the installed CLI). If usage goes stale — you'll see the `?` / `⚠ STALE`
+from the installed CLI). If usage goes stale — you'll see the `stale` / `⚠ STALE`
 marker — check that header first. The whole design degrades silently, so a break
 costs you a blank or visibly-stale readout, nothing more.
 
