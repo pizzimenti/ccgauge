@@ -379,9 +379,17 @@ def cmd_status():
     p5, p7 = c.get("five_hour_pct"), c.get("seven_day_pct")
     bits = []
     if p5 is not None:
-        bits.append(f"{_color(p5)}5h:{p5}%\033[0m")
+        frag = f"{_color(p5)}5h:{p5}%\033[0m"
+        s5 = _secs_until(c.get("five_hour_reset"))
+        if s5 is not None and s5 > 0:
+            frag += f"\033[2m({s5 // 3600}h:{(s5 % 3600) // 60:02d}m)\033[0m"
+        bits.append(frag)
     if p7 is not None:
-        bits.append(f"{_color(p7)}7d:{p7}%\033[0m")
+        frag = f"{_color(p7)}7d:{p7}%\033[0m"
+        s7 = _secs_until(c.get("seven_day_reset"))
+        if s7 is not None and s7 > 0:
+            frag += f"\033[2m({s7 / 86400:.1f}d)\033[0m"
+        bits.append(frag)
     if not bits:
         return
     age = _now() - c.get("fetched_at", _now())

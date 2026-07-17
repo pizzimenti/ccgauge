@@ -4,6 +4,13 @@ All notable changes to ccgauge are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); this project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.4.0] — 2026-07-17
+
+### Added
+- Status-line countdowns: the `usage.py status` fragment now shows the time
+  until each window resets — `5h:69%(0h:31m)` and `7d:19%(2.6d)` — rendered
+  dim next to the colour-coded utilization, still reading only the cache.
+
 ## [0.3.0] — 2026-07-16
 
 ### Changed
