@@ -56,6 +56,7 @@ CRED = os.path.join(BASE, ".credentials.json")
 CACHE = os.path.join(BASE, "usage-cache.json")
 COOLDOWN = os.path.join(BASE, "usage-429-cooldown")
 LOG = os.path.join(BASE, "usage-log.jsonl")
+LOCK = os.path.join(BASE, "usage-refresh.lock")
 
 URL = "https://api.anthropic.com/api/oauth/usage"
 BETA = "oauth-2025-04-20"
@@ -360,6 +361,44 @@ def fmt_reset(iso):
 # --------------------------------------------------------------------------- #
 # core
 # --------------------------------------------------------------------------- #
+_NO_LOCK = object()  # sentinel: proceed with refresh but without a real lock
+
+
+def _acquire_refresh_lock():
+    """Grab the cross-process refresh lock, non-blocking.
+
+    Returns the held lock fd on success; None if another refresh already holds
+    it (the caller should serve cache rather than fire a duplicate request); the
+    _NO_LOCK sentinel when fcntl is unavailable, so refresh proceeds unlocked
+    exactly as it did before locking existed.
+    """
+    if not fcntl:
+        return _NO_LOCK
+    try:
+        fd = open(LOCK, "w")
+    except Exception:
+        return _NO_LOCK  # can't create the lock file; don't block refresh
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except Exception:
+        fd.close()
+        return None      # another refresh is in flight right now
+    return fd
+
+
+def _release_refresh_lock(handle):
+    if handle is _NO_LOCK:
+        return
+    try:
+        fcntl.flock(handle, fcntl.LOCK_UN)
+    except Exception:
+        pass
+    try:
+        handle.close()
+    except Exception:
+        pass
+
+
 def refresh(force=False):
     if not force:
         age = cache_age()
@@ -373,27 +412,42 @@ def refresh(force=False):
     if exp_s and exp_s < _now() + 30:
         # token is expired or about to expire; let Claude Code refresh it
         return read_cache()
-    status, body, retry_after = _http_get(token)
-    if status == 200 and body:
-        data = normalise(body)
-        try:
-            with open(CACHE, "w") as fh:
-                json.dump(data, fh)
-        except Exception:
-            pass
-        else:
-            # only if the write landed: a "fetch" event means the cache (the
-            # single source of truth every reader serves from) really updated
-            log_event("fetch",
-                      five_hour_pct=data.get("five_hour_pct"),
-                      seven_day_pct=data.get("seven_day_pct"))
-        clear_cooldown()
-        return data
-    if status == 429:
-        delay = set_cooldown(retry_after)
-        log_event("cooldown_429", backoff_s=int(delay),
-                  retry_after=int(retry_after) if retry_after else None)
-    return read_cache()
+    # Serialize the fetch+cooldown update across processes. Two overlapping
+    # UserPromptSubmit hooks each spawn a detached refresh, and both can clear
+    # in_cooldown() above before either fires — without this guard they double-
+    # hit the endpoint and, reading the same consecutive-429 count, fail to
+    # escalate the backoff. A non-blocking lock means the refresh that loses the
+    # race serves cache instead of sending a duplicate request.
+    lock = _acquire_refresh_lock()
+    if lock is None:
+        return read_cache()
+    try:
+        if in_cooldown():
+            # whoever won the lock may have just armed the cooldown; re-check
+            return read_cache()
+        status, body, retry_after = _http_get(token)
+        if status == 200 and body:
+            data = normalise(body)
+            try:
+                with open(CACHE, "w") as fh:
+                    json.dump(data, fh)
+            except Exception:
+                pass
+            else:
+                # only if the write landed: a "fetch" event means the cache (the
+                # single source of truth every reader serves from) really updated
+                log_event("fetch",
+                          five_hour_pct=data.get("five_hour_pct"),
+                          seven_day_pct=data.get("seven_day_pct"))
+            clear_cooldown()
+            return data
+        if status == 429:
+            delay = set_cooldown(retry_after)
+            log_event("cooldown_429", backoff_s=int(delay),
+                      retry_after=int(retry_after) if retry_after else None)
+        return read_cache()
+    finally:
+        _release_refresh_lock(lock)
 
 
 # --------------------------------------------------------------------------- #
