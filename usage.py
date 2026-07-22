@@ -361,6 +361,18 @@ def fmt_reset(iso):
     return f"in {h}h {m}m" if h else f"in {m}m"
 
 
+def fmt_clock(epoch):
+    """Epoch seconds -> local wall-clock 'HH:MM' (or '' on failure).
+
+    Used to show *when* the last successful refresh landed, so a stale readout
+    reads as "as of 17:52" instead of a bare "stale".
+    """
+    try:
+        return datetime.fromtimestamp(epoch).strftime("%H:%M")
+    except Exception:
+        return ""
+
+
 # --------------------------------------------------------------------------- #
 # core
 # --------------------------------------------------------------------------- #
@@ -533,7 +545,9 @@ def cmd_line():
                        " Claude Code renews it on its own, retry next turn")
             else:
                 why = "endpoint unreachable"
-        line += (f"  ⚠ STALE {age // 60}m — {why}."
+        clk = fmt_clock(c.get("fetched_at"))
+        since = f" (last good {clk})" if clk else ""
+        line += (f"  ⚠ STALE {age // 60}m{since} — {why}."
                  f" The values above are the last successful read, NOT current;"
                  f" do not trust them. Run `/usage` in-app for live numbers.")
     else:
@@ -607,11 +621,15 @@ def cmd_status(plain=False):
         bits.append(seg("7d", p7, c.get("seven_day_reset"), "d", 8640))
     if not bits:
         return
-    age = _now() - c.get("fetched_at", _now())
+    fetched_at = c.get("fetched_at")
+    age = _now() - (fetched_at or _now())
     if age > STALE_SECONDS:
-        # A clear word beats the old cryptic '?': this fragment is the last
-        # successful read, NOT live, whenever the endpoint is unreachable.
-        bits.append("stale" if plain else "\033[2mstale\033[0m")
+        # Show the wall-clock time of the last successful read (e.g. "@17:52")
+        # rather than a bare "stale": you can see at a glance how old the number
+        # is. Fall back to "stale" only if the timestamp is somehow unreadable.
+        clk = fmt_clock(fetched_at) if fetched_at else ""
+        marker = f"@{clk}" if clk else "stale"
+        bits.append(marker if plain else f"\033[2m{marker}\033[0m")
     if plain:
         sys.stdout.write(" · ".join(bits))
     else:
