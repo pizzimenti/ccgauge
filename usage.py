@@ -26,7 +26,10 @@ Design constraints:
 
 Modes (argv[1]):
     refresh  (default) -- fetch only if cache is stale & not in cooldown
-    line                -- one-line snapshot for the UserPromptSubmit hook
+    line                -- one-line snapshot for the UserPromptSubmit hook;
+                           does one synchronous fetch first if the cache is
+                           stale (missing / idle past STALE_SECONDS), so the
+                           first prompt after a break shows live numbers
     status [plain]      -- short fragment (5h/7d bars) for the status line;
                            `plain` drops ANSI so the caller owns the colour
     bar <pct>           -- a standalone 0-100 progress bar (e.g. for context %)
@@ -471,6 +474,21 @@ def cmd_line():
         cwd = "~" + cwd[len(HOME):]
     session = hook.get("session_id")
     c = read_cache()
+    # Freshen synchronously when the readout would otherwise be stale: no cache
+    # yet, or we've been idle long enough (> STALE_SECONDS) that the per-turn
+    # background warm-refresh hasn't run. Without this, the first prompt after a
+    # break prints a last-known/STALE line even though the endpoint is reachable
+    # and a good value lands ~1s later (on the *next* turn) — the exact "we're
+    # stale again" false alarm. refresh() self-throttles (no-ops in a 429
+    # cooldown or with a missing/expiring token, bounded by HTTP_TIMEOUT), and
+    # the gate below keeps this off the hot path: an active session's cache is
+    # well under STALE_SECONDS, so this never fires and `line` stays instant.
+    if not in_cooldown():
+        prev_age = (_now() - c.get("fetched_at", 0)) if c else None
+        if prev_age is None or prev_age > STALE_SECONDS:
+            fresh = refresh()
+            if fresh:
+                c = fresh
     if not c:
         log_event("prompt", cwd=cwd, session_id=session)
         print("[usage] no data yet (warming up — will populate next turn)")
@@ -495,7 +513,18 @@ def cmd_line():
                      else f"week(7d) {p7}% used (resets {r7})")
     line = "[usage] " + " · ".join(parts)
     if stale:
-        line += (f"  ⚠ STALE {age // 60}m — endpoint unreachable/rate-limited."
+        # We only reach here after the synchronous freshen above already tried
+        # and failed, so name the real cause instead of the old catch-all: an
+        # active 429 cooldown (we know exactly when the next retry is) versus an
+        # endpoint we genuinely couldn't reach.
+        if in_cooldown():
+            until, _ = _read_cooldown()
+            wait = max(0, int(until - _now()))
+            why = (f"endpoint rate-limited (429) — next retry in "
+                   f"{wait // 60}m{wait % 60:02d}s")
+        else:
+            why = "endpoint unreachable"
+        line += (f"  ⚠ STALE {age // 60}m — {why}."
                  f" The values above are the last successful read, NOT current;"
                  f" do not trust them. Run `/usage` in-app for live numbers.")
     else:
