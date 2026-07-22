@@ -514,16 +514,25 @@ def cmd_line():
     line = "[usage] " + " · ".join(parts)
     if stale:
         # We only reach here after the synchronous freshen above already tried
-        # and failed, so name the real cause instead of the old catch-all: an
-        # active 429 cooldown (we know exactly when the next retry is) versus an
-        # endpoint we genuinely couldn't reach.
+        # and failed. refresh() serves cache without ever hitting the endpoint
+        # for several distinct reasons, so re-derive which one applies (in the
+        # same guard order refresh() uses) rather than blaming the endpoint for
+        # all of them: an expired login token after an idle gap is the common
+        # case and must not read as "endpoint unreachable". Anything left — a
+        # non-200/429 HTTP status, a network error, or transient refresh-lock
+        # contention — is a genuine reach-the-endpoint failure.
         if in_cooldown():
             until, _ = _read_cooldown()
             wait = max(0, int(until - _now()))
             why = (f"endpoint rate-limited (429) — next retry in "
                    f"{wait // 60}m{wait % 60:02d}s")
         else:
-            why = "endpoint unreachable"
+            token, exp_s = load_token()
+            if not token or (exp_s and exp_s < _now() + 30):
+                why = ("auth token unavailable (login expired or refreshing) —"
+                       " Claude Code renews it on its own, retry next turn")
+            else:
+                why = "endpoint unreachable"
         line += (f"  ⚠ STALE {age // 60}m — {why}."
                  f" The values above are the last successful read, NOT current;"
                  f" do not trust them. Run `/usage` in-app for live numbers.")
