@@ -26,7 +26,10 @@ Design constraints:
 
 Modes (argv[1]):
     refresh  (default) -- fetch only if cache is stale & not in cooldown
-    line                -- one-line snapshot for the UserPromptSubmit hook
+    line                -- one-line snapshot for the UserPromptSubmit hook;
+                           does one synchronous fetch first if the cache is
+                           stale (missing / idle past STALE_SECONDS), so the
+                           first prompt after a break shows live numbers
     status [plain]      -- short fragment (5h/7d bars) for the status line;
                            `plain` drops ANSI so the caller owns the colour
     bar <pct>           -- a standalone 0-100 progress bar (e.g. for context %)
@@ -358,6 +361,40 @@ def fmt_reset(iso):
     return f"in {h}h {m}m" if h else f"in {m}m"
 
 
+def fmt_clock(epoch):
+    """Epoch seconds -> local wall-clock 'HH:MM' (or '' on failure).
+
+    Used to show *when* the last successful refresh landed, so a stale readout
+    reads as "as of 17:52" instead of a bare "stale".
+    """
+    try:
+        return datetime.fromtimestamp(epoch).strftime("%H:%M")
+    except Exception:
+        return ""
+
+
+def _stale_why(reason):
+    """Human cause for a stale readout, from a refresh() outcome reason.
+
+    Named straight from what refresh() actually did, so lock contention and
+    credential rotation don't get mislabeled as the endpoint being down.
+    """
+    if reason in ("cooldown", "429"):
+        until, _ = _read_cooldown()
+        wait = max(0, int(until - _now()))
+        return (f"endpoint rate-limited (429) — next retry in "
+                f"{wait // 60}m{wait % 60:02d}s")
+    if reason in ("no_token", "expiring_token"):
+        return ("auth token unavailable (login expired or refreshing) —"
+                " Claude Code renews it on its own, retry next turn")
+    if reason == "lock_contended":
+        return ("another refresh is already in flight (a second session or"
+                " `usage.py show`) — retry next turn")
+    # http_error, or an unexpected/unknown reason: treat as a real failure to
+    # reach the endpoint.
+    return "endpoint unreachable"
+
+
 # --------------------------------------------------------------------------- #
 # core
 # --------------------------------------------------------------------------- #
@@ -404,18 +441,38 @@ def _release_refresh_lock(handle):
         pass
 
 
-def refresh(force=False):
+def refresh(force=False, outcome=None):
+    """Refresh the cache if stale; return the cache dict (fresh or last-known).
+
+    When `outcome` is a dict, records *why* this call resolved the way it did in
+    outcome["reason"] — one of: "fresh" (cache still within TTL), "ok" (fetched
+    and wrote a new value), "cooldown" (a 429 back-off is active), "no_token" /
+    "expiring_token" (credentials unusable — Claude Code rotates them), "429"
+    (this call hit a 429 and armed the back-off), "lock_contended" (another
+    refresh holds the lock — the endpoint was never contacted here), or
+    "http_error" (a genuine non-200/non-429/network failure). Readers use this
+    to name a stale cause precisely instead of guessing after the fact, which
+    both mislabels lock contention and opens a check-after-refresh TOCTOU race.
+    """
+    def _out(reason):
+        if outcome is not None:
+            outcome["reason"] = reason
+
     if not force:
         age = cache_age()
         if age is not None and age < TTL_SECONDS:
+            _out("fresh")
             return read_cache()
     if in_cooldown():
+        _out("cooldown")
         return read_cache()
     token, exp_s = load_token()
     if not token:
+        _out("no_token")
         return read_cache()
     if exp_s and exp_s < _now() + 30:
         # token is expired or about to expire; let Claude Code refresh it
+        _out("expiring_token")
         return read_cache()
     # Serialize the fetch+cooldown update across processes. Two overlapping
     # UserPromptSubmit hooks each spawn a detached refresh, and both can clear
@@ -425,16 +482,19 @@ def refresh(force=False):
     # race serves cache instead of sending a duplicate request.
     lock = _acquire_refresh_lock()
     if lock is None:
+        _out("lock_contended")
         return read_cache()
     try:
         if in_cooldown():
             # whoever won the lock may have just armed the cooldown; re-check
+            _out("cooldown")
             return read_cache()
         if not force:
             age = cache_age()
             if age is not None and age < TTL_SECONDS:
                 # a refresh that beat us to the lock already refreshed the
                 # cache; don't fire a now-redundant request
+                _out("fresh")
                 return read_cache()
         status, body, retry_after = _http_get(token)
         if status == 200 and body:
@@ -451,11 +511,15 @@ def refresh(force=False):
                           five_hour_pct=data.get("five_hour_pct"),
                           seven_day_pct=data.get("seven_day_pct"))
             clear_cooldown()
+            _out("ok")
             return data
         if status == 429:
             delay = set_cooldown(retry_after)
             log_event("cooldown_429", backoff_s=int(delay),
                       retry_after=int(retry_after) if retry_after else None)
+            _out("429")
+            return read_cache()
+        _out("http_error")
         return read_cache()
     finally:
         _release_refresh_lock(lock)
@@ -471,6 +535,26 @@ def cmd_line():
         cwd = "~" + cwd[len(HOME):]
     session = hook.get("session_id")
     c = read_cache()
+    # Freshen synchronously when the readout would otherwise be stale: no cache
+    # yet, or we've been idle long enough (> STALE_SECONDS) that the per-turn
+    # background warm-refresh hasn't run. Without this, the first prompt after a
+    # break prints a last-known/STALE line even though the endpoint is reachable
+    # and a good value lands ~1s later (on the *next* turn) — the exact "we're
+    # stale again" false alarm. refresh() self-throttles (returns instantly in a
+    # 429 cooldown or with a missing/expiring token, bounded by HTTP_TIMEOUT
+    # otherwise), and the gate keeps this off the hot path: an active session's
+    # cache is well under STALE_SECONDS, so this never fires and `line` stays
+    # instant. We capture refresh()'s outcome so a still-stale readout can name
+    # its real cause rather than re-deriving it afterward (which mislabels lock
+    # contention and races token/cooldown state).
+    reason = None
+    prev_age = (_now() - c.get("fetched_at", 0)) if c else None
+    if prev_age is None or prev_age > STALE_SECONDS:
+        outcome = {}
+        fresh = refresh(outcome=outcome)
+        reason = outcome.get("reason")
+        if fresh:
+            c = fresh
     if not c:
         log_event("prompt", cwd=cwd, session_id=session)
         print("[usage] no data yet (warming up — will populate next turn)")
@@ -495,7 +579,16 @@ def cmd_line():
                      else f"week(7d) {p7}% used (resets {r7})")
     line = "[usage] " + " · ".join(parts)
     if stale:
-        line += (f"  ⚠ STALE {age // 60}m — endpoint unreachable/rate-limited."
+        # Name the real cause from refresh()'s own outcome (captured above), not
+        # a re-derivation: an expired login token after an idle gap, or another
+        # process holding the refresh lock, must not read as "endpoint
+        # unreachable". If refresh() wasn't called this turn (reason is None —
+        # e.g. the cache was under STALE_SECONDS by fetched_at but flagged stale
+        # by mtime), fall back to a plain endpoint-unreachable label.
+        why = _stale_why(reason)
+        clk = fmt_clock(c.get("fetched_at"))
+        since = f" (last good {clk})" if clk else ""
+        line += (f"  ⚠ STALE {age // 60}m{since} — {why}."
                  f" The values above are the last successful read, NOT current;"
                  f" do not trust them. Run `/usage` in-app for live numbers.")
     else:
@@ -548,18 +641,28 @@ def cmd_status(plain=False):
         return
     p5, p7 = c.get("five_hour_pct"), c.get("seven_day_pct")
 
+    # Decide staleness up front: the per-window countdowns are computed from the
+    # cached reset timestamps, so when the cache is stale they'd render as if
+    # live (and a window may already have reset). Suppress them while stale and
+    # show only the last-good wall-clock marker. A missing/invalid fetched_at
+    # counts as stale so the fallback marker still appears.
+    fetched_at = c.get("fetched_at")
+    age = _now() - fetched_at if isinstance(fetched_at, (int, float)) else None
+    stale = age is None or age > STALE_SECONDS
+
     # In plain mode emit NO ANSI: the caller (e.g. a status-line snippet) owns
     # the color and can render the whole fragment in one hue. The default keeps
     # the per-window severity colors (green/yellow/red) for standalone use.
     def seg(label, pct, reset_iso, unit, denom):
         core = f"{label} {_bar(pct)} {pct}%"
         frag = core if plain else f"{_color(pct)}{core}\033[0m"
-        secs = _secs_until(reset_iso)
-        if secs is not None and secs > 0:
-            # ceil to one decimal: a live countdown must never show 0.0
-            # (nor understate the wait) while the window is still limiting
-            span = f"({math.ceil(secs / denom) / 10:.1f}{unit})"
-            frag += span if plain else f"\033[2m{span}\033[0m"
+        if not stale:
+            secs = _secs_until(reset_iso)
+            if secs is not None and secs > 0:
+                # ceil to one decimal: a live countdown must never show 0.0
+                # (nor understate the wait) while the window is still limiting
+                span = f"({math.ceil(secs / denom) / 10:.1f}{unit})"
+                frag += span if plain else f"\033[2m{span}\033[0m"
         return frag
 
     bits = []
@@ -569,11 +672,13 @@ def cmd_status(plain=False):
         bits.append(seg("7d", p7, c.get("seven_day_reset"), "d", 8640))
     if not bits:
         return
-    age = _now() - c.get("fetched_at", _now())
-    if age > STALE_SECONDS:
-        # A clear word beats the old cryptic '?': this fragment is the last
-        # successful read, NOT live, whenever the endpoint is unreachable.
-        bits.append("stale" if plain else "\033[2mstale\033[0m")
+    if stale:
+        # Show the wall-clock time of the last successful read (e.g. "@17:52")
+        # rather than a bare "stale": you can see at a glance how old the number
+        # is. Fall back to "stale" only if the timestamp is somehow unreadable.
+        clk = fmt_clock(fetched_at)
+        marker = f"@{clk}" if clk else "stale"
+        bits.append(marker if plain else f"\033[2m{marker}\033[0m")
     if plain:
         sys.stdout.write(" · ".join(bits))
     else:

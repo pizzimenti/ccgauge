@@ -134,10 +134,12 @@ it states none, rather than retry on a fixed clock.
 
 - **Into the assistant's context.** `hooks/usage-line.sh` is a `UserPromptSubmit`
   hook; Claude Code appends its stdout to the model's context before each turn.
-  The script kicks off a *detached* background refresh (so your prompt never
-  waits on the network) and prints the currently-cached snapshot. Consequence:
-  the number can be one turn stale — fine for a 5-hour window, and worth it for
-  zero latency.
+  It prints the cached snapshot — instantly, with no network wait, whenever the
+  cache is warm — then kicks off a *detached* background refresh to keep the
+  cache fresh for the next turn. The one exception: if the cache has already
+  gone stale (the first prompt after an idle gap), it does a single bounded,
+  self-throttled synchronous fetch first, so you see live numbers instead of a
+  last-known readout that a refresh would replace one turn later.
 - **Onto the status line.** `usage.py status` prints a short coloured
   `5h [█░░░░░░░░░] 11%(3.7h) 7d [░░░░░░░░░░] 3%(5.2d)` fragment — a 10-segment
   progress bar per window (one segment per 10%) with the percentage beside it,
@@ -147,11 +149,14 @@ it states none, rather than retry on a fixed clock.
   colour), and `usage.py bar <pct>` renders a standalone bar for any 0–100 value
   — handy for giving Claude Code's own context-window `%` the same treatment.
 
-If the cache ever stops updating (e.g. the endpoint becomes unreachable), the
-readout doesn't silently keep showing a frozen number: once data is older than
-`STALE_SECONDS` (30 min), the status line appends the word `stale` and the
-context line spells out that the shown values are the last successful read and
-NOT current. Stale is visibly distinct from fresh.
+If the cache still can't refresh (the endpoint is genuinely unreachable, the
+login token is mid-rotation, or a 429 cooldown is active), the readout doesn't
+silently keep showing a frozen number: once data is older than `STALE_SECONDS`
+(30 min), the status line shows the wall-clock time of the last good read
+(`@17:52`) in place of the live countdown, and the context line spells out both
+the cause — `endpoint unreachable`, `auth token unavailable`, or
+`rate-limited (429) — next retry in Xm` — and that the shown values are the last
+successful read, NOT current. Stale is visibly distinct from fresh.
 
 ### Usage history log
 
@@ -214,7 +219,7 @@ describe a window that has already reset.
 | One writer, N readers | High-frequency surfaces never cause network calls. |
 | `mtime` as the TTL clock | No extra state file; survives restarts. |
 | Never throws | A telemetry gadget must never break a hook or status line. Worst case: it shows nothing. |
-| Detached background refresh | Zero prompt latency; accept one-turn staleness. |
+| Synchronous fetch only when stale | Warm-cache turns stay zero-latency; only the first prompt after an idle gap pays a bounded fetch, and it shows live numbers rather than a one-turn-stale value. |
 | python3, not jq | `jq` is often missing; python3 is always present, with real JSON + datetime handling. |
 | Secret stays in the worker | The token is read by `usage.py` and used only in the request to Anthropic's own API. The cache holds only percentages and reset times. |
 
@@ -224,9 +229,9 @@ Every failure degrades to silence, never a crash or a stall:
 
 | Failure | Behavior |
 | --- | --- |
-| Token expired | Serve stale cache; Claude Code refreshes the token during normal use. |
-| 429 rate-limited | Honor `Retry-After` (else exponential backoff, capped 2h), serve stale cache, stop polling until it clears. |
-| Network down / timeout | Serve last known cache. |
+| Token expired | Serve last read, marked `auth token unavailable`; Claude Code refreshes the token during normal use. |
+| 429 rate-limited | Honor `Retry-After` (else exponential backoff, capped 2h); serve last read, marked `rate-limited (429)` with the retry countdown; stop polling until it clears. |
+| Network down / timeout | Serve last read, marked `endpoint unreachable`. |
 | Endpoint removed / header rejected | Cache ages out; `line` prints "unavailable". |
 | Malformed upstream JSON | `line`/`status` print nothing rather than crash. |
 | History log unwritable | Silent — the readout is unaffected. |
@@ -236,7 +241,7 @@ Every failure degrades to silence, never a crash or a stall:
 This rests on an **undocumented, reverse-engineered endpoint** that Anthropic
 has declined to officially support. It can break on any update. The most likely
 break point is the `anthropic-beta` date header (the `User-Agent` is now derived
-from the installed CLI). If usage goes stale — you'll see the `stale` / `⚠ STALE`
+from the installed CLI). If usage goes stale — you'll see the `@HH:MM` / `⚠ STALE`
 marker — check that header first. The whole design degrades silently, so a break
 costs you a blank or visibly-stale readout, nothing more.
 
