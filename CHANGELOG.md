@@ -4,6 +4,32 @@ All notable changes to ccgauge are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); this project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.6.0] — 2026-07-23
+
+### Fixed
+- **No more false `STALE` on the first prompt after a break.** The context line
+  printed the cached value while a detached refresh raced it, so returning after
+  an idle gap always showed a `⚠ STALE … endpoint unreachable` marker for one
+  turn — even though the endpoint was reachable and a good value landed a second
+  later. The hook now does a single bounded, self-throttled synchronous fetch
+  when (and only when) the cache is already stale, and runs before the
+  background refresh so it wins the refresh lock. Active-session prompts still
+  read the warm cache with zero added latency.
+- **Stale readouts name their real cause.** Instead of labeling every failure
+  `endpoint unreachable`, the message now distinguishes a 429 cooldown (with the
+  next-retry countdown), an expired or rotating login token (`auth token
+  unavailable` — Claude Code renews it on its own), another refresh already in
+  flight, and a genuinely unreachable endpoint.
+- **No fake-live countdowns on a stale status line.** The per-window reset
+  countdowns are computed from cached timestamps that may already have reset, so
+  they are now suppressed whenever the readout is stale.
+
+### Added
+- **Last-refresh timestamp on stale readouts.** The status line shows `@HH:MM`
+  (the wall-clock time of the last successful read) in place of the bare
+  `stale`, and the context line's `⚠ STALE Nm` marker gains `(last good HH:MM)`
+  — so you can see at a glance how old the number really is.
+
 ## [0.5.0] — 2026-07-17
 
 ### Fixed
