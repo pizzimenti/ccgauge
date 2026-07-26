@@ -672,12 +672,17 @@ def cmd_status(plain=False):
         bits.append(seg("7d", p7, c.get("seven_day_reset"), "d", 8640))
     if not bits:
         return
-    if stale:
-        # Show the wall-clock time of the last successful read (e.g. "@17:52")
-        # rather than a bare "stale": you can see at a glance how old the number
-        # is. Fall back to "stale" only if the timestamp is somehow unreadable.
-        clk = fmt_clock(fetched_at)
-        marker = f"@{clk}" if clk else "stale"
+    # Always show the wall-clock time of the last successful read (e.g. "@17:52").
+    # Fresh, it confirms the gauge is actually updating (and how recently); stale,
+    # it's how old the frozen number is — and since the per-window countdowns are
+    # suppressed while stale, this marker is then the only time signal. fetched_at
+    # is the last successful fetch in both cases, so "@HH:MM" reads consistently as
+    # "data as of HH:MM". Fall back to a bare "stale" only when the readout IS
+    # stale and the timestamp is somehow unreadable; when it's fresh but the clock
+    # can't be formatted, show nothing rather than a misleading "stale".
+    clk = fmt_clock(fetched_at)
+    marker = f"@{clk}" if clk else ("stale" if stale else "")
+    if marker:
         bits.append(marker if plain else f"\033[2m{marker}\033[0m")
     if plain:
         sys.stdout.write(" · ".join(bits))

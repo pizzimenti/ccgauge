@@ -4,6 +4,17 @@ All notable changes to ccgauge are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); this project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.6.1] — 2026-07-26
+
+### Changed
+- **The last-refresh `@HH:MM` timestamp is now always on the status line**, not
+  only when the readout is stale. Fresh, it trails the reset countdowns
+  (`… 27%(3.0d) · @15:38`) so you can see at a glance that the gauge is actually
+  updating and how recently; stale, it stays put as the sole time signal (the
+  per-window countdowns remain suppressed, since they're derived from cached
+  reset times that may already have passed). `fetched_at` is the last successful
+  fetch in both cases, so `@HH:MM` reads consistently as "data as of HH:MM".
+
 ## [0.6.0] — 2026-07-23
 
 ### Fixed

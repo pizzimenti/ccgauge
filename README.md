@@ -6,9 +6,9 @@ A fuel gauge for your Claude Max plan.
 Claude Code's `/usage` command shows — but continuously, in two places:
 
 - **On your status line**, as a live
-  `5h [█░░░░░░░░░] 11%(3.7h) 7d [░░░░░░░░░░] 3%(5.2d)` readout — a 10-segment
-  progress bar per window with the percentage beside it, colour-coded, and a
-  countdown to each window's reset.
+  `5h [█░░░░░░░░░] 11%(3.7h) · 7d [░░░░░░░░░░] 3%(5.2d) · @15:38` readout — a
+  10-segment progress bar per window with the percentage beside it, colour-coded,
+  a countdown to each window's reset, and the time it was last refreshed.
 - **In the assistant's context**, injected each turn via a `UserPromptSubmit`
   hook, so Claude itself can warn you as you approach a limit.
 
@@ -141,20 +141,22 @@ it states none, rather than retry on a fixed clock.
   self-throttled synchronous fetch first, so you see live numbers instead of a
   last-known readout that a refresh would replace one turn later.
 - **Onto the status line.** `usage.py status` prints a short coloured
-  `5h [█░░░░░░░░░] 11%(3.7h) 7d [░░░░░░░░░░] 3%(5.2d)` fragment — a 10-segment
-  progress bar per window (one segment per 10%) with the percentage beside it,
-  colour-coded (green < 70, yellow < 90, red ≥ 90) and each followed by a dim
-  countdown to that window's reset — reading only the cache. `usage.py status
-  plain` emits the same fragment without ANSI (for a snippet that paints it one
-  colour), and `usage.py bar <pct>` renders a standalone bar for any 0–100 value
-  — handy for giving Claude Code's own context-window `%` the same treatment.
+  `5h [█░░░░░░░░░] 11%(3.7h) · 7d [░░░░░░░░░░] 3%(5.2d) · @15:38` fragment — a
+  10-segment progress bar per window (one segment per 10%) with the percentage
+  beside it, colour-coded (green < 70, yellow < 90, red ≥ 90) and each followed
+  by a dim countdown to that window's reset, then a trailing dim `@HH:MM` marking
+  when the shown numbers were last refreshed — reading only the cache. `usage.py
+  status plain` emits the same fragment without ANSI (for a snippet that paints
+  it one colour), and `usage.py bar <pct>` renders a standalone bar for any 0–100
+  value — handy for giving Claude Code's own context-window `%` the same treatment.
 
 If the cache still can't refresh (the endpoint is genuinely unreachable, the
 login token is mid-rotation, or a 429 cooldown is active), the readout doesn't
 silently keep showing a frozen number: once data is older than `STALE_SECONDS`
-(30 min), the status line shows the wall-clock time of the last good read
-(`@17:52`) in place of the live countdown, and the context line spells out both
-the cause — `endpoint unreachable`, `auth token unavailable`, or
+(30 min), the status line drops the per-window countdowns — they're derived from
+cached reset times that may already have passed — and leans on that always-present
+`@HH:MM` last-refresh marker as the sole time signal, while the context line spells
+out both the cause — `endpoint unreachable`, `auth token unavailable`, or
 `rate-limited (429) — next retry in Xm` — and that the shown values are the last
 successful read, NOT current. Stale is visibly distinct from fresh.
 
