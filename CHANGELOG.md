@@ -4,6 +4,53 @@ All notable changes to ccgauge are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); this project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.7.0] — 2026-07-28
+
+### Added
+- **Pace shadow on every gauge.** Each bar now draws the point where an
+  evenly-paced spend would sit right now, derived from how much of the window
+  has elapsed — half-way through the 5-hour window (2.5h in), the mark is at
+  50%. It renders as a shadow behind the fill with two extra shades: `▒` is
+  pace headroom you haven't spent (you're running ahead), `▓` is spend that has
+  run past the mark (orange — you're burning too fast). Only one is ever
+  present, and the reading works both ways: `█`+`▓` is what you've used,
+  `█`+`▒` is where the mark sits. A percentage alone couldn't tell you whether
+  40% used was comfortable or alarming; now the gauge does.
+
+  ```
+  5h [██▒▒▒░░░░░] 20%(2.5h)   half-way in, a fifth spent — three segments of headroom
+  5h [████▓▓░░░░] 60%(2.4h)   pace is at 40%, so two segments are past the mark
+  5h [█████░░░░░] 50%(2.5h)   exactly on pace: no shadow at all
+  ```
+
+  The shadow is suppressed whenever the readout goes stale, alongside the
+  per-window countdowns and for the same reason: the mark comes from a live
+  clock, and measuring it against a frozen percentage would manufacture
+  overspend that isn't there.
+
+### Changed
+- **The bars are no longer severity-coloured.** They set no colour for `█` and
+  `▒` at all, so they inherit whatever the terminal — or the status line
+  wrapping them — is already using, and the zones separate by luminance: full
+  block, half-tint block, faint block. Orange overspend is the only colour a
+  bar introduces, so the one thing that *is* a warning is the only thing that
+  pulls the eye. The green/yellow/red ramp still colours the **percentage**
+  beside each bar in the non-`plain` mode, so the fullness signal is intact.
+- **`status plain` now governs the text only.** It leaves the label, percentage
+  and countdown uncoloured for a caller that paints the fragment one hue, but
+  the bar still carries its dim tail and orange overspend, because those encode
+  which segments are unearned and which are overspend — data the caller has no
+  way to reconstruct. Previously `plain` stripped them, which meant a status
+  line using it saw the pace shadow in a single flat colour and could not read
+  it at all.
+- **`usage.py show` states the comparison in words** as well as drawing the
+  bar — `Session (5h): [██▒▒▒░░░░░] 20% used — resets in 2h 29m (pace 50%,
+  30 pts under pace)`. Previously `show` printed no bar at all.
+- **`usage.py bar <pct> [pace]`** takes an optional second value, so callers
+  rendering their own gauge can draw a pace shadow too. Omitted, the bar is
+  byte-identical to before — Claude Code's context window has no clock, so the
+  status-line snippet's `ctx` bar is unchanged.
+
 ## [0.6.1] — 2026-07-26
 
 ### Changed

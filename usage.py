@@ -31,8 +31,10 @@ Modes (argv[1]):
                            stale (missing / idle past STALE_SECONDS), so the
                            first prompt after a break shows live numbers
     status [plain]      -- short fragment (5h/7d bars) for the status line;
-                           `plain` drops ANSI so the caller owns the colour
-    bar <pct>           -- a standalone 0-100 progress bar (e.g. for context %)
+                           `plain` leaves the *text* uncoloured so the caller owns
+                           its hue (the bars always keep their own two tints)
+    bar <pct> [pace]    -- a standalone 0-100 progress bar (e.g. for context %),
+                           with the pace shadow when a second value is given
     show                -- force a synchronous refresh, print a human block
     log [N]             -- print the last N history events (default 20)
 """
@@ -75,6 +77,8 @@ BACKOFF_BASE = 600       # first 429 backs off this long (fallback when no Retry
 BACKOFF_CAP = 7200       # ...doubling per consecutive 429, capped here (2h) so the token's usage
                          # bucket can actually drain instead of us re-arming the server-side lockout
 STALE_SECONDS = 1800     # mark the readout as stale (endpoint likely unreachable) past this
+FIVE_HOUR_SECS = 5 * 3600    # span of the session window — the denominator for its pace mark
+SEVEN_DAY_SECS = 7 * 86400   # ...and of the weekly window
 HTTP_TIMEOUT = 6
 ACT_PCT = 95             # session window at/above this: inject wind-down directive
 LOG_MAX_BYTES = 1 << 20  # trim the history log once it outgrows this...
@@ -350,6 +354,25 @@ def _secs_until(iso):
         return None
 
 
+def pace_pct(reset_iso, window_secs):
+    """Where an evenly-paced spend would sit right now, 0-100 (None if unknown).
+
+    A window that resets at T started at T - window_secs, so the fraction of it
+    already elapsed is exactly the fraction of the allowance you could have
+    spent and still land on 100% at the reset. Half-way through the 5h window
+    (2.5h in) the pace mark is 50%.
+
+    Clamped to 0-100: a `resets_at` that has already passed (a stale cache, or
+    the window rolling over between fetch and render) would otherwise push the
+    mark past the end of the bar.
+    """
+    secs = _secs_until(reset_iso)
+    if secs is None or not window_secs:
+        return None
+    elapsed = window_secs - secs
+    return max(0.0, min(100.0, elapsed / float(window_secs) * 100.0))
+
+
 def fmt_reset(iso):
     """ISO timestamp -> 'in 4h 1m' (or '' on failure)."""
     secs = _secs_until(iso)
@@ -621,18 +644,84 @@ def _color(pct):
     return "\033[0;32m"       # green
 
 
-def _bar(pct, cells=10):
-    """A `cells`-segment progress bar — one filled segment per (100/cells)%, so
-    10 cells = 10% each: `[░░░░░░░░░░]` at 0, `[██░░░░░░░░]` at ~20, `[██████████]`
-    at 100. The percentage is deliberately NOT drawn inside the bar (it would
-    occlude segments) — render the number alongside it.
-    """
+UNDER_PACE = "▒"  # allowance you could have spent by now but haven't
+OVER_PACE = "▓"   # spend that has already run past the pace mark
+
+# The bar is deliberately calm. It paints itself in the terminal's own foreground
+# instead of a green/yellow/red severity ramp, and lets the glyphs carry the three
+# zones that aren't warnings: `█` solid for spend, `▒` half-tint for headroom you
+# could still spend and stay on pace, `░` faint for the part of the window not yet
+# earned. That's a clean luminance ramp in whatever colour the terminal already
+# uses, which leaves orange as the single colour the bar introduces — so the one
+# thing that *is* a warning is the only thing that pulls the eye.
+#
+# Orange from the 256-colour cube rather than a bright red or magenta from the
+# 16-colour set: those resolve to whatever the user's theme says they mean (some
+# themes alias bright back to normal, landing the tint on a colour already on
+# screen; Solarized remaps bright red to orange outright), whereas 208 is a fixed
+# point and lands identically everywhere. The usual objection to it — that orange
+# sits next to the yellow severity band — doesn't apply now that the bar has no
+# severity colours in it at all.
+BAR_BASE = "\033[39m"          # the terminal's default foreground
+DIM_ON, DIM_OFF = "\033[2m", "\033[22m"
+OVER_TINT = "\033[38;5;208m"   # orange — the bar's only warning colour
+
+
+def _cells(pct, cells):
+    """A 0-100 value as a whole number of bar segments (0..cells)."""
     try:
         p = max(0.0, min(100.0, float(pct)))
     except (TypeError, ValueError):
         p = 0.0
-    filled = max(0, min(cells, round(p / 100 * cells)))
-    return "[" + "█" * filled + "░" * (cells - filled) + "]"
+    return max(0, min(cells, round(p / 100 * cells)))
+
+
+def _bar(pct, cells=10, pace=None, ansi=False):
+    """A `cells`-segment progress bar — one filled segment per (100/cells)%, so
+    10 cells = 10% each: `[░░░░░░░░░░]` at 0, `[██░░░░░░░░]` at ~20, `[██████████]`
+    at 100. The percentage is deliberately NOT drawn inside the bar (it would
+    occlude segments) — render the number alongside it.
+
+    Given `pace` (0-100 — where an evenly-paced spend would sit right now, from
+    pace_pct()), the bar also carries a shadow of that mark, so you can see at a
+    glance whether you are ahead of or behind the window's refill rate:
+
+        [██▒▒▒░░░░░]  20% used, 50% pace — three segments of unspent headroom
+        [█████▓░░░░]  60% used, 50% pace — one segment already past the mark
+
+    The two shades never co-occur, and the invariant reads both ways: `█`+`▓` is
+    always what you have used, `█`+`▒` is always where the pace mark sits.
+
+    With `ansi`, the bar colours itself per the scheme above: the terminal's own
+    default foreground for the spend and headroom glyphs, dim for the unearned
+    tail, and orange for any overspend. It sets the default foreground rather than
+    inheriting, so a caller painting its fragment a warm hue cannot collide with
+    the orange; the text either side of the bar is left to the caller.
+
+    Without `ansi` — the default — it emits no escape codes at all, which is what
+    a caller rendering an unrelated value (a context-window percentage, say) wants:
+    such a value has no pace mark, so it needs none of the scheme's colours.
+    """
+    used = _cells(pct, cells)
+    mark = None if pace is None else _cells(pace, cells)
+    if mark is None or mark == used:
+        head, mid, tail = used, "", cells - used
+    elif mark > used:
+        head, mid, tail = used, UNDER_PACE * (mark - used), cells - mark
+    else:
+        head, mid, tail = mark, OVER_PACE * (used - mark), cells - used
+    if not ansi:
+        return "[" + "█" * head + mid + "░" * tail + "]"
+    if mark is not None and mark < used:
+        mid = OVER_TINT + mid + BAR_BASE
+    # Assert the default foreground rather than inheriting the caller's colour.
+    # Inheriting looks tempting — it is one fewer escape code and it lets a status
+    # line theme the bar — but it silently breaks the whole scheme when the caller
+    # happens to be using a warm hue: ANSI yellow renders as amber or orange on
+    # most themes, so an inherited bar becomes indistinguishable from the orange
+    # that is supposed to be the one alarming thing on it.
+    return (BAR_BASE + "[" + "█" * head + mid
+            + DIM_ON + "░" * tail + DIM_OFF + "]")
 
 
 def cmd_status(plain=False):
@@ -650,12 +739,24 @@ def cmd_status(plain=False):
     age = _now() - fetched_at if isinstance(fetched_at, (int, float)) else None
     stale = age is None or age > STALE_SECONDS
 
-    # In plain mode emit NO ANSI: the caller (e.g. a status-line snippet) owns
-    # the color and can render the whole fragment in one hue. The default keeps
-    # the per-window severity colors (green/yellow/red) for standalone use.
-    def seg(label, pct, reset_iso, unit, denom):
-        core = f"{label} {_bar(pct)} {pct}%"
-        frag = core if plain else f"{_color(pct)}{core}\033[0m"
+    # `plain` governs the *text* only — the label, percentage and countdown are
+    # left uncoloured so a caller (e.g. a status-line snippet) can render the
+    # whole fragment in one hue of its choosing. The bar always carries its own
+    # two tints regardless, because they encode data the caller cannot
+    # reconstruct: which segments are overspend, and which are unearned. It also
+    # holds the terminal's default foreground for its own glyphs rather than
+    # taking the caller's hue, so orange stays the only thing on the bar that
+    # means something is wrong.
+    def seg(label, pct, reset_iso, unit, denom, window):
+        # The pace shadow is derived from the same cached reset time as the
+        # countdown, and compares it against a *cached* percentage — so while
+        # stale it would pit a live clock against a frozen number and read as
+        # ever-worsening overspend. Suppress it exactly when the countdown is
+        # suppressed, leaving a bar with no mark on it.
+        pace = None if stale else pace_pct(reset_iso, window)
+        bar = _bar(pct, pace=pace, ansi=True)
+        core = f"{label} {bar} {pct}%"
+        frag = core if plain else f"{label} {bar} {_color(pct)}{pct}%\033[0m"
         if not stale:
             secs = _secs_until(reset_iso)
             if secs is not None and secs > 0:
@@ -667,9 +768,9 @@ def cmd_status(plain=False):
 
     bits = []
     if p5 is not None:
-        bits.append(seg("5h", p5, c.get("five_hour_reset"), "h", 360))
+        bits.append(seg("5h", p5, c.get("five_hour_reset"), "h", 360, FIVE_HOUR_SECS))
     if p7 is not None:
-        bits.append(seg("7d", p7, c.get("seven_day_reset"), "d", 8640))
+        bits.append(seg("7d", p7, c.get("seven_day_reset"), "d", 8640, SEVEN_DAY_SECS))
     if not bits:
         return
     # Always show the wall-clock time of the last successful read (e.g. "@17:52").
@@ -700,15 +801,31 @@ def cmd_show():
         return
     p5, p7 = c.get("five_hour_pct"), c.get("seven_day_pct")
     age = int(_now() - c.get("fetched_at", _now()))
+    stale = age > STALE_SECONDS
+
+    def row(label, pct, reset_iso, window):
+        # Same stale gate as the status line: a frozen percentage measured
+        # against a live clock would manufacture overspend that isn't there.
+        pace = None if stale else pace_pct(reset_iso, window)
+        line = (f"  {label}: {_bar(pct, pace=pace, ansi=True)} {pct}% used"
+                f" — resets {fmt_reset(reset_iso)}")
+        if pace is not None and pct is not None:
+            gap = round(pct - pace)
+            n = abs(gap)
+            drift = (f"{n} pt{'' if n == 1 else 's'} {'over' if gap > 0 else 'under'} pace"
+                     if gap else "on pace")
+            line += f"  (pace {round(pace)}%, {drift})"
+        return line
+
     print("Claude subscription usage")
-    print(f"  Session (5h): {p5}% used — resets {fmt_reset(c.get('five_hour_reset'))}")
-    print(f"  Weekly  (7d): {p7}% used — resets {fmt_reset(c.get('seven_day_reset'))}")
+    print(row("Session (5h)", p5, c.get("five_hour_reset"), FIVE_HOUR_SECS))
+    print(row("Weekly  (7d)", p7, c.get("seven_day_reset"), SEVEN_DAY_SECS))
     if c.get("seven_day_opus_pct") is not None:
         print(f"  Weekly Opus : {c['seven_day_opus_pct']}% used")
     # Be honest when the forced refresh could NOT reach the endpoint: a live
     # `show` that silently returns hour-old cache is exactly how a stale 0% gets
     # mistaken for current. Flag the cache age and any active back-off.
-    if age > STALE_SECONDS or in_cooldown():
+    if stale or in_cooldown():
         until, consec = _read_cooldown()
         wait = int(until - _now())
         note = f"  ⚠ NOT live — cached {age // 60}m ago"
@@ -761,10 +878,22 @@ def main():
         elif mode == "bar":
             # Render a standalone progress bar for an arbitrary 0-100 value, so
             # callers (e.g. a status line showing Claude Code's own context %)
-            # can reuse the exact same bar as the 5h/7d fragments.
+            # can reuse the exact same bar as the 5h/7d fragments. An optional
+            # second value draws the pace shadow, for callers that know their
+            # own budget line (a context window has no clock, so it has none).
             if len(sys.argv) > 2:
+                pace = None
+                if len(sys.argv) > 3:
+                    try:
+                        pace = float(sys.argv[3])
+                    except ValueError:
+                        pass  # unparseable shadow: draw the bar without one
                 try:
-                    sys.stdout.write(_bar(float(sys.argv[2])))
+                    # Colour only once a pace mark is in play: a bare value has
+                    # nothing to warn about, and callers already wrap it in a
+                    # hue of their own.
+                    sys.stdout.write(_bar(float(sys.argv[2]), pace=pace,
+                                          ansi=pace is not None))
                 except ValueError:
                     pass
         elif mode == "show":
