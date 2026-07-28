@@ -104,7 +104,7 @@ def user_agent():
     if _UA_CACHE is not None:
         return _UA_CACHE
     ua = DEFAULT_UA
-    try:
+    with contextlib.suppress(Exception):
         out = subprocess.run(
             ["claude", "--version"],
             capture_output=True, text=True, timeout=5, check=False,
@@ -112,8 +112,6 @@ def user_agent():
         m = re.search(r"(\d+\.\d+\.\d+)", out)
         if m:
             ua = "claude-code/" + m.group(1)
-    except Exception:
-        pass
     _UA_CACHE = ua
     return ua
 
@@ -187,19 +185,15 @@ def set_cooldown(retry_after=None):
         delay = max(int(retry_after), 60)          # trust the server; floor at 60s
     else:
         delay = min(BACKOFF_BASE * (2 ** (consecutive - 1)), BACKOFF_CAP)
-    try:
+    with contextlib.suppress(Exception):
         with open(COOLDOWN, "w") as fh:
             json.dump({"until": _now() + delay, "consecutive": consecutive}, fh)
-    except Exception:
-        pass
     return delay
 
 
 def clear_cooldown():
-    try:
+    with contextlib.suppress(Exception):
         os.remove(COOLDOWN)
-    except Exception:
-        pass
 
 
 def log_event(event, **fields):
@@ -212,7 +206,7 @@ def log_event(event, **fields):
     for at most one ~1 MiB read+write (milliseconds). Without fcntl
     (non-POSIX) it degrades to unlocked appends.
     """
-    try:
+    with contextlib.suppress(Exception):
         rec = {
             "ts": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
             "event": event,
@@ -236,8 +230,6 @@ def log_event(event, **fields):
                 fh.seek(0)
                 fh.truncate()
                 fh.writelines(keep)
-    except Exception:
-        pass
 
 
 def _hook_payload():
@@ -246,13 +238,11 @@ def _hook_payload():
     Guarded by isatty so a manual `usage.py line` at a terminal never blocks
     waiting for input. The prompt text in the payload is never logged.
     """
-    try:
+    with contextlib.suppress(Exception):
         if sys.stdin is not None and not sys.stdin.isatty():
             raw = sys.stdin.read()
             if raw.strip():
                 return json.loads(raw)
-    except Exception:
-        pass
     return {}
 
 
@@ -273,15 +263,13 @@ def _retry_after_seconds(err):
         ra = ra.strip()
         if ra.isdigit():
             return int(ra)
-        try:
+        with contextlib.suppress(Exception):
             from email.utils import parsedate_to_datetime
             dt = parsedate_to_datetime(ra)
             if dt is not None:
                 if dt.tzinfo is None:
                     dt = dt.replace(tzinfo=timezone.utc)
                 return max(0, int((dt - datetime.now(timezone.utc)).total_seconds()))
-        except Exception:
-            pass
     for key in ("anthropic-ratelimit-unified-reset",
                 "anthropic-ratelimit-unified-5h-reset",
                 "anthropic-ratelimit-requests-reset",
@@ -486,14 +474,10 @@ def _acquire_refresh_lock():
 def _release_refresh_lock(handle):
     if handle is _NO_LOCK:
         return
-    try:
+    with contextlib.suppress(Exception):
         fcntl.flock(handle, fcntl.LOCK_UN)
-    except Exception:
-        pass
-    try:
+    with contextlib.suppress(Exception):
         handle.close()
-    except Exception:
-        pass
 
 
 def refresh(force=False, outcome=None):
@@ -953,7 +937,9 @@ def cmd_log():
 
 def main():
     mode = sys.argv[1] if len(sys.argv) > 1 else "refresh"
-    try:
+    # The never-raise contract, enforced at the one place every mode passes
+    # through: whatever happens below, this exits 0 and disrupts nothing.
+    with contextlib.suppress(Exception):
         if mode == "refresh":
             refresh()
         elif mode == "line":
@@ -972,20 +958,16 @@ def main():
                     # unparseable shadow: draw the bar without one
                     with contextlib.suppress(ValueError):
                         pace = float(sys.argv[3])
-                try:
-                    # Colour only once a pace mark is in play: a bare value has
-                    # nothing to warn about, and callers already wrap it in a
-                    # hue of their own.
+                # Colour only once a pace mark is in play: a bare value has
+                # nothing to warn about, and callers already wrap it in a
+                # hue of their own.
+                with contextlib.suppress(ValueError):
                     sys.stdout.write(_bar(float(sys.argv[2]), pace=pace,
                                           ansi=pace is not None))
-                except ValueError:
-                    pass
         elif mode == "show":
             cmd_show()
         elif mode == "log":
             cmd_log()
-    except Exception:
-        pass  # never disrupt a hook or status line
     sys.exit(0)
 
 
