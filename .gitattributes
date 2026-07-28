@@ -1,0 +1,11 @@
+# Git for Windows defaults to core.autocrlf=true, which would check these out
+# with CRLF line endings. bash then chokes on the shebang —
+# `bad interpreter: /usr/bin/env bash^M` — and `git clone && ./install.sh`
+# fails immediately, for a reason that looks nothing like the actual cause.
+# Force LF on everything executed as a script, on every platform.
+*.sh   text eol=lf
+*.py   text eol=lf
+
+# Markdown and config are text; let git normalise them in the repo.
+*.md   text
+*.json text

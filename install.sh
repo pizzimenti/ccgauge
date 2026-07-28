@@ -216,8 +216,16 @@ if updated == original:
     print(f"  {G}ok{X}    settings.json already correct — not rewritten")
     sys.exit(0)
 
+# Never overwrite an existing backup, even one made in the same second: the
+# timestamp has one-second resolution, and two runs inside one second (a script,
+# a fast retry) would otherwise have the second copy clobber the first — exactly
+# the data loss the timestamping exists to prevent.
 stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
 backup = f"{path}.{stamp}.bak"
+n = 1
+while os.path.exists(backup):
+    n += 1
+    backup = f"{path}.{stamp}-{n}.bak"
 try:
     shutil.copy2(path, backup)
 except Exception as exc:
@@ -231,9 +239,23 @@ if 'replacing' in dir() and replacing:
 
 # Write via a temp file in the same directory, then rename: an interrupted write
 # must not leave a truncated settings.json, which Claude Code would refuse.
+#
+# The replacement takes the *new* file's default permissions, not the original's,
+# so a settings.json deliberately restricted to 0600 would silently widen to
+# whatever the umask allows — a file that holds hook commands and can hold
+# tokens. Carry the mode across explicitly.
 tmp = path + ".tmp"
+try:
+    mode = os.stat(path).st_mode & 0o7777
+except OSError:
+    mode = None
 with open(tmp, "w") as fh:
     fh.write(updated)
+if mode is not None:
+    try:
+        os.chmod(tmp, mode)
+    except OSError:
+        pass
 os.replace(tmp, path)
 PY
   if [ "${settings_write_failed:-0}" -eq 1 ]; then
@@ -250,7 +272,7 @@ echo
 echo "ccgauge: verifying"
 
 for f in "$USAGE_DST" "$HOOK_DST" "$STATUSLINE_DST"; do
-  if [ -x "$f" ]; then ok "present and executable: ${f#$CONFIG_DIR/}"
+  if [ -x "$f" ]; then ok "present and executable: ${f#"$CONFIG_DIR"/}"
   elif [ -f "$f" ]; then fail "not executable: $f  (chmod +x it)"
   else fail "missing: $f  (re-run ./install.sh without --check)"
   fi
@@ -273,9 +295,10 @@ fi
 # rate limit the tool exists to respect. `--check` is meant to be safe to run
 # repeatedly while diagnosing a problem, including a rate-limit problem, so it
 # runs neither: firing a request to diagnose a lockout is how you extend one.
-MODES="status log"
-[ "$CHECK_ONLY" -eq 0 ] && MODES="refresh $MODES"
-for mode in $MODES; do
+# `refresh` is not here either: on a cold cache it fetches, and `show` further
+# down forces a second fetch seconds later. It is exercised *after* that, when
+# the cache is warm and it self-throttles to a no-op.
+for mode in status log; do
   if python3 "$USAGE_DST" "$mode" > /dev/null 2>&1 < /dev/null; then
     ok "usage.py $mode exits cleanly"
   else
@@ -350,6 +373,17 @@ printf '%s\n' "$settings_report"
 [ "$settings_ok" -eq 1 ] || \
   fail "settings.json is unreadable, or is missing the hook or the status line"
 
+# Do the one forced refresh HERE, before the render checks, and report it further
+# down. Ordering matters for the request count: the hook runs `usage.py line`,
+# which does its own synchronous fetch when the cache is cold. Warming the cache
+# first means that call finds fresh data and makes no request of its own, so a
+# whole install costs exactly one — against an endpoint that 429s hard when
+# polled too fast, "exactly one" is worth some awkward sequencing.
+show_out=""
+if [ "$CHECK_ONLY" -eq 0 ] && [ -r "$CONFIG_DIR/.credentials.json" ]; then
+  show_out=$(python3 "$USAGE_DST" show 2>/dev/null || true)
+fi
+
 # The hook and the status line must both produce output for a realistic payload.
 #
 # Built with json.dumps rather than string splicing: a repo path containing a
@@ -369,16 +403,39 @@ print(json.dumps({"workspace": {"current_dir": os.environ["PWD_VAL"]},
 #
 # CCGAUGE_USAGE_PY is cleared so these exercise the usage.py we just installed
 # rather than whatever an ambient environment points at.
-hook_cmd_stored=$(SETTINGS="$SETTINGS" python3 -c '
-import json, os
+# Select *ccgauge's own* entries, not simply the first one present. Picking the
+# first UserPromptSubmit hook runs a stranger's script and then fails it for not
+# printing [usage]; taking the statusLine unconditionally runs the status line we
+# just deliberately preserved and fails it for not drawing our glyphs. Both
+# declare a correct install broken.
+hook_cmd_stored=$(SETTINGS="$SETTINGS" TARGET="$HOOK_DST" python3 -c '
+import json, os, shlex
+def refers_to(cmd, target):
+    try:
+        words = shlex.split(cmd or "")
+    except ValueError:
+        words = (cmd or "").split()
+    return any(os.path.realpath(w) == os.path.realpath(target) for w in words if w)
 cfg = json.load(open(os.environ["SETTINGS"]))
 groups = (cfg.get("hooks") or {}).get("UserPromptSubmit") or []
+target = os.environ["TARGET"]
 print(next((h.get("command", "") for g in groups if isinstance(g, dict)
-            for h in g.get("hooks", []) if isinstance(h, dict)), ""))' 2>/dev/null || echo "")
-sl_cmd_stored=$(SETTINGS="$SETTINGS" python3 -c '
-import json, os
+            for h in g.get("hooks", []) if isinstance(h, dict)
+            and refers_to(h.get("command"), target)), ""))' 2>/dev/null || echo "")
+
+# Empty unless the configured status line is ours; a preserved foreign one is
+# reported as skipped rather than executed and judged by our criteria.
+sl_cmd_stored=$(SETTINGS="$SETTINGS" TARGET="$STATUSLINE_DST" python3 -c '
+import json, os, shlex
+def refers_to(cmd, target):
+    try:
+        words = shlex.split(cmd or "")
+    except ValueError:
+        words = (cmd or "").split()
+    return any(os.path.realpath(w) == os.path.realpath(target) for w in words if w)
 cfg = json.load(open(os.environ["SETTINGS"]))
-print(((cfg.get("statusLine") or {}).get("command")) or "")' 2>/dev/null || echo "")
+cmd = ((cfg.get("statusLine") or {}).get("command")) or ""
+print(cmd if refers_to(cmd, os.environ["TARGET"]) else "")' 2>/dev/null || echo "")
 
 hook_err=$(mktemp); sl_err=$(mktemp)
 trap 'rm -f "$hook_err" "$sl_err"' EXIT
@@ -403,7 +460,11 @@ fi
 # always emits ANSI escapes, so "is the output non-empty" can never fail, and
 # folding stderr in would make an error message look like a successful render.
 if [ -z "$sl_cmd_stored" ]; then
-  warn "no status line command in settings.json to exercise"
+  # Either nothing is configured (already FAILed by the settings check above) or
+  # the user's own status line is configured and we left it alone on purpose.
+  # Judging theirs by whether it draws ccgauge's glyphs would fail a setup the
+  # README explicitly supports.
+  ok "status line is not ccgauge's — not exercised"
 elif sl_out=$(printf '%s' "$SAMPLE" | env -u CCGAUGE_USAGE_PY sh -c "$sl_cmd_stored" 2>"$sl_err") \
      && printf '%s' "$sl_out" | grep -q '[█░]'; then
   ok "status line renders a gauge"
@@ -433,9 +494,8 @@ except Exception:
   fi
 else
   ok "OAuth credentials readable"
-  # Exactly one forced refresh per run, its output reused for both the check and
-  # the display. See the note on the mode loop above.
-  show_out=$(python3 "$USAGE_DST" show 2>/dev/null || true)
+  # $show_out was captured before the render checks — see the note there. One
+  # forced refresh per run, its output reused for both the verdict and display.
   # `show` prints the cached percentages *and* a "NOT live" note when the forced
   # refresh could not land, so grepping for '%' would call an active 429
   # cooldown "endpoint reachable". Ask the question the other way round.
@@ -448,6 +508,13 @@ else
   else
     warn "could not read live usage yet (endpoint, rate limit, or token refresh)"
     warn "this is normal right after install; check again with: ./install.sh --check"
+  fi
+  # Now that `show` has populated the cache, `refresh` self-throttles to a no-op,
+  # so its never-raise contract can be checked without a second request.
+  if python3 "$USAGE_DST" refresh > /dev/null 2>&1 < /dev/null; then
+    ok "usage.py refresh exits cleanly"
+  else
+    fail "usage.py refresh exited non-zero — it must never disrupt a hook"
   fi
 fi
 
