@@ -6,9 +6,10 @@ A fuel gauge for your Claude Max plan.
 Claude Code's `/usage` command shows — but continuously, in two places:
 
 - **On your status line**, as a live
-  `5h [█░░░░░░░░░] 11%(3.7h) · 7d [░░░░░░░░░░] 3%(5.2d) · @15:38` readout — a
-  10-segment progress bar per window with the percentage beside it, colour-coded,
-  a countdown to each window's reset, and the time it was last refreshed.
+  `5h [█▒▒░░░░░░░] 11%(3.7h) · 7d [▒▒▒▒░░░░░░░░░░] 3%(5.2d) · @15:38` readout — a
+  progress bar per window with the percentage beside it, colour-coded,
+  a pace shadow showing whether you're ahead of or behind the window's refill
+  rate, a countdown to each window's reset, and the time it was last refreshed.
 - **In the assistant's context**, injected each turn via a `UserPromptSubmit`
   hook, so Claude itself can warn you as you approach a limit.
 
@@ -16,9 +17,9 @@ It reads the OAuth token Claude Code already stores on disk, queries the
 (undocumented) usage endpoint, and caches the result. No API key, no password,
 no browser — and the token never leaves your machine.
 
-```
-~ ctx:10% Opus 4.8 (1M context) 5h [█░░░░░░░░░] 11%(3.7h) 7d [░░░░░░░░░░] 3%(5.2d)
-                                 └──────────────────────────────────────────────┘ ccgauge
+```text
+~ ctx:10% Opus 4.8 (1M context) 5h [█▒▒░░░░░░░] 11%(3.7h) 7d [▒▒▒▒░░░░░░░░░░] 3%(5.2d)
+                                 └──────────────────────────────────────────────────┘ ccgauge
 ```
 
 ## Why
@@ -140,25 +141,127 @@ it states none, rather than retry on a fixed clock.
   gone stale (the first prompt after an idle gap), it does a single bounded,
   self-throttled synchronous fetch first, so you see live numbers instead of a
   last-known readout that a refresh would replace one turn later.
-- **Onto the status line.** `usage.py status` prints a short coloured
-  `5h [█░░░░░░░░░] 11%(3.7h) · 7d [░░░░░░░░░░] 3%(5.2d) · @15:38` fragment — a
-  10-segment progress bar per window (one segment per 10%) with the percentage
-  beside it, colour-coded (green < 70, yellow < 90, red ≥ 90) and each followed
-  by a dim countdown to that window's reset, then a trailing dim `@HH:MM` marking
-  when the shown numbers were last refreshed — reading only the cache. `usage.py
-  status plain` emits the same fragment without ANSI (for a snippet that paints
-  it one colour), and `usage.py bar <pct>` renders a standalone bar for any 0–100
-  value — handy for giving Claude Code's own context-window `%` the same treatment.
+- **Onto the status line.** `usage.py status` prints a short
+  `5h [█▒▒░░░░░░░] 11%(3.7h) · 7d [▒▒▒▒░░░░░░░░░░] 3%(5.2d) · @15:38` fragment —
+  a progress bar per window with the percentage beside it, colour-coded
+  (green < 70, yellow < 90, red ≥ 90), each followed by a dim countdown to that
+  window's reset, then a trailing dim `@HH:MM` marking when the shown numbers
+  were last refreshed — reading only the cache. `usage.py bar <pct> [pace]`
+  renders a standalone bar for any 0–100 value, handy for giving Claude Code's
+  own context-window `%` the same treatment.
+
+  **Segment counts are chosen so one segment is a round slice of wall-clock
+  time**: the 5-hour bar has 10 segments, half an hour each; the 7-day bar has
+  14, half a day each. That makes the pace mark readable as a position *in the
+  window* rather than just a fraction — a 7d mark on segment 9 means you're into
+  the fifth day.
+
+  **`usage.py status plain` emits no ANSI whatsoever**, so a caller can paint the
+  fragment a hue of its own or measure its display width to pad and truncate it.
+  Colour mode is the mirror image: every span closes itself, so the fragment can
+  be dropped anywhere without leaking state into the text after it. The **bar is
+  never severity-coloured** in either mode — see [the pace shadow](#the-pace-shadow).
 
 If the cache still can't refresh (the endpoint is genuinely unreachable, the
 login token is mid-rotation, or a 429 cooldown is active), the readout doesn't
 silently keep showing a frozen number: once data is older than `STALE_SECONDS`
 (30 min), the status line drops the per-window countdowns — they're derived from
-cached reset times that may already have passed — and leans on that always-present
-`@HH:MM` last-refresh marker as the sole time signal, while the context line spells
-out both the cause — `endpoint unreachable`, `auth token unavailable`, or
-`rate-limited (429) — next retry in Xm` — and that the shown values are the last
-successful read, NOT current. Stale is visibly distinct from fresh.
+cached reset times that may already have passed — and leans
+on that always-present `@HH:MM` last-refresh marker as the sole time signal, while
+the context line spells out both the cause — `endpoint unreachable`, `auth token
+unavailable`, or `rate-limited (429) — next retry in Xm` — and that the shown
+values are the last successful read, NOT current. Stale is visibly distinct from
+fresh.
+
+### The pace shadow
+
+A percentage alone doesn't tell you whether you're *spending too fast* — 40% used
+is comfortable three hours into the 5-hour window and alarming twenty minutes in.
+So each bar also carries a **pace mark**: the point where an evenly-paced spend
+would sit right now, given how much of the window has already elapsed. Half-way
+through the 5-hour window (2.5h in), the pace mark is at 50% — half the gauge.
+
+The mark is drawn as a shadow *behind* the fill, using two extra shades:
+
+| | Meaning | Rendered as |
+| :-- | :-- | :-- |
+| `█` | Spend that is **within** pace | terminal's default foreground |
+| `▒` | Pace headroom you **haven't** spent — you're running ahead | terminal's default foreground (the glyph is its own light tint) |
+| `▓` | Spend that has run **past** the mark — you're burning too fast | **orange** |
+| `░` | Neither spent nor yet earned | dim |
+
+Only one of `▒`/`▓` is ever present, and the reading works both directions:
+`█`+`▓` is always what you've used, `█`+`▒` is always where the pace mark sits.
+
+```text
+5h [██▒▒▒░░░░░] 20%(2.5h)   half-way in, only a fifth spent — three segments of headroom
+5h [████▓▓░░░░] 60%(2.4h)   pace is at 40%, so two segments are past the mark
+5h [█████░░░░░] 50%(2.5h)   exactly on pace: no shadow at all
+```
+
+Cell arithmetic rounds **half away from zero**, not with Python's built-in `round`
+(which is banker's rounding, ties-to-even). The bar shows two rounded values at
+once and the eye reads the *distance* between them, so their rounding has to be
+consistent: under ties-to-even, 45% and 35% both land on segment 4 and a full
+segment of overspend silently disappears.
+
+### Why the bar is calm
+
+The bar deliberately **does not** paint itself green/yellow/red. It holds the
+terminal's default foreground for `█` and `▒`, and the four zones separate by
+*luminance* instead: a full block, a half-tint block, a faint block. That's a
+clean ramp in whatever colour the terminal is already using.
+
+Which leaves orange as the single colour the bar introduces, so the one thing that
+*is* a warning is the only thing that pulls your eye. The alternative — colouring
+the whole bar by severity — spends colour on the thing the bar's own length already
+tells you, and then has nothing distinctive left for the overspend.
+
+Orange comes from the 256-colour cube (`38;5;208`) rather than a bright red or
+magenta out of the 16-colour set. Those resolve to whatever the user's theme decides
+they mean: some themes alias bright back to normal, landing the tint on a colour
+already on screen, and Solarized remaps bright red to orange outright. `208` is a
+fixed point and lands identically everywhere. The usual objection to it — that
+orange sits next to the yellow severity band — doesn't apply, because there is no
+yellow in the bar.
+
+It also asserts that default foreground rather than inheriting the caller's colour.
+Inheriting is tempting — one fewer escape code, and it lets a status line theme the
+bar — but ANSI yellow renders as amber on most themes, so an inherited bar under a
+yellow-wrapped status line becomes indistinguishable from the orange it has to
+contrast with.
+
+Every escape the bar emits is an *absolute* SGR state, because ANSI has no
+save/restore: `39m` means "default foreground", not "whatever you had", and `22m`
+means "normal intensity", not "the intensity you were at". So a coloured bar closes
+with a full reset and is self-contained, and a caller that needs to own the
+colouring — or to measure the fragment's display width — asks for `status plain`,
+which emits nothing at all.
+
+`usage.py show` spells the same comparison out in words (`(pace 50%, 30 pts under
+pace)`).
+
+### When the mark is not drawn
+
+The mark comes from the live clock while the percentage beside it comes from the
+cache, so the two drift apart as the cache ages — and **the drift is directional**.
+The mark advances while the percentage stands still, so an old cache renders *more*
+`▒` headroom than you really have. It under-reports overspend, which is the
+dangerous direction, so the mark is held to a much tighter age budget than the
+readout as a whole: it disappears once the cache is older than one refresh interval
+(`PACE_MAX_AGE`, 10 min — about a third of a segment of drift on the 5-hour window),
+against the 30 minutes it takes to flag the numbers themselves as stale.
+
+Gating on age rather than on any particular refresh failure also covers the cases
+where `show`'s forced refresh silently returns cache — a 429 cooldown, a contended
+lock, a rotating token. What matters for the mark is how old the percentage is, not
+why it couldn't be renewed.
+
+The mark also disappears entirely once a window's `resets_at` has **passed**, rather
+than being clamped to the end of the bar. An elapsed reset means the window has
+rolled over and the cached percentage describes a window that no longer exists;
+clamping would draw a nearly-full bar with a sliver of headroom at the exact moment
+the truth is a fresh window with everything still to spend.
 
 ### Usage history log
 
