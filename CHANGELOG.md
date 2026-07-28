@@ -23,33 +23,80 @@ All notable changes to ccgauge are documented here. Format follows
   5h [█████░░░░░] 50%(2.5h)   exactly on pace: no shadow at all
   ```
 
-  The shadow is suppressed whenever the readout goes stale, alongside the
-  per-window countdowns and for the same reason: the mark comes from a live
-  clock, and measuring it against a frozen percentage would manufacture
-  overspend that isn't there.
+  The mark comes from the live clock while the percentage beside it comes from
+  the cache, so the two drift apart as the cache ages — and the drift is
+  directional: the mark advances while the percentage stands still, so an old
+  cache renders *more* headroom than you really have. Because that under-reports
+  overspend, the mark is held to a much tighter age budget than the readout as a
+  whole, disappearing once the cache is older than one refresh interval
+  (`PACE_MAX_AGE`, 10 min) against the 30 minutes it takes to flag the numbers
+  themselves as stale. Gating on age also covers the cases where `show`'s forced
+  refresh silently returns cache — a 429 cooldown, a contended lock, a rotating
+  token — since what matters is how old the percentage is, not why it could not
+  be renewed. The mark also disappears once a window's `resets_at` has passed
+  rather than clamping to the end of the bar: an elapsed reset means the window
+  has rolled over and the cached percentage describes a window that no longer
+  exists.
 
 ### Changed
-- **The bars are no longer severity-coloured.** They set no colour for `█` and
-  `▒` at all, so they inherit whatever the terminal — or the status line
-  wrapping them — is already using, and the zones separate by luminance: full
-  block, half-tint block, faint block. Orange overspend is the only colour a
-  bar introduces, so the one thing that *is* a warning is the only thing that
-  pulls the eye. The green/yellow/red ramp still colours the **percentage**
-  beside each bar in the non-`plain` mode, so the fullness signal is intact.
-- **`status plain` now governs the text only.** It leaves the label, percentage
-  and countdown uncoloured for a caller that paints the fragment one hue, but
-  the bar still carries its dim tail and orange overspend, because those encode
-  which segments are unearned and which are overspend — data the caller has no
-  way to reconstruct. Previously `plain` stripped them, which meant a status
-  line using it saw the pace shadow in a single flat colour and could not read
-  it at all.
-- **`usage.py show` states the comparison in words** as well as drawing the
-  bar — `Session (5h): [██▒▒▒░░░░░] 20% used — resets in 2h 29m (pace 50%,
-  30 pts under pace)`. Previously `show` printed no bar at all.
+- **Bars are sized so one segment is a round slice of wall-clock time.** The
+  5-hour bar keeps its 10 segments (half an hour each) and the **7-day bar is
+  now 14** (half a day each), so the pace mark reads as a position *in the
+  window* rather than just a fraction — a 7d mark on segment 9 means you're into
+  the fifth day.
+- **The bars are no longer severity-coloured.** They hold the terminal's default
+  foreground for `█` and `▒`, and the zones separate by luminance: full block,
+  half-tint block, faint block. Orange overspend is the only colour a bar
+  introduces, so the one thing that *is* a warning is the only thing that pulls
+  the eye. The green/yellow/red ramp still colours the **percentage** beside each
+  bar in the non-`plain` mode, so the fullness signal is intact.
+
+  The bar *asserts* that default foreground rather than inheriting the caller's
+  colour. Inheriting is tempting — one fewer escape code, and it lets a status
+  line theme the bar — but ANSI yellow renders as amber on most themes, so an
+  inherited bar under a yellow-wrapped status line is indistinguishable from the
+  orange it has to contrast with.
+- **Cell arithmetic rounds half away from zero**, where it previously used
+  Python's built-in `round` (banker's rounding, ties-to-even). The bar now shows
+  two rounded values at once and the eye reads the distance between them, so
+  their rounding has to be consistent: under ties-to-even, 45% and 35% both land
+  on segment 4 and a full segment of overspend silently disappears. This also
+  shifts the standalone `bar <pct>` by one segment for percentages ending in 5
+  (`bar 45` is now five segments, not four).
+- **Non-finite values no longer render as a full bar.** `min(100.0, nan)` returns
+  `100.0` in Python — every comparison against NaN is False, so the running
+  minimum survives — which meant the clamp promoted `nan` and `inf` to the worst
+  possible reading instead of bounding them. `usage.py bar nan` now draws an
+  empty bar, and a non-finite pace draws no mark rather than a mark at zero.
+- **`status plain` really does emit no ANSI.** A caller asking for it wants to
+  own the colouring, or to measure the fragment's display width to pad and
+  truncate it, and either is broken by a stray escape it can neither see nor
+  undo. Colour mode is the mirror image and is fully self-contained: every span
+  closes itself, so the fragment can be dropped anywhere without leaking state
+  into the text after it.
+- **`usage.py show` draws bars and states the comparison in words** —
+  `Session (5h): [██▒▒▒░░░░░] 20% used — resets in 2h 29m (pace 50%, 30 pts
+  under pace)`. Previously it printed no bar at all. It emits ANSI only when
+  stdout is a terminal, so redirecting or capturing it still yields clean text,
+  and the `Weekly Opus` row gained a bar too so the percentage column stays
+  aligned.
 - **`usage.py bar <pct> [pace]`** takes an optional second value, so callers
-  rendering their own gauge can draw a pace shadow too. Omitted, the bar is
-  byte-identical to before — Claude Code's context window has no clock, so the
-  status-line snippet's `ctx` bar is unchanged.
+  rendering their own gauge can draw a pace shadow too. Omitted, it stays
+  escape-free — Claude Code's context window has no clock, so the status-line
+  snippet's `ctx` bar needs none of the scheme's colours.
+
+### Fixed
+- **A window whose percentage is missing no longer renders as 0% used.** A
+  partial API response leaves one window's `utilization` absent while its
+  `resets_at` still lands in the cache; `show` drew a bar for it anyway, and
+  since the cell arithmetic coerces `None` to zero the gauge positively asserted
+  "nothing spent, all this headroom" about a number it did not have. It now
+  prints `no data` for that window.
+- **`show` no longer goes silent on an unreadable cache timestamp.** It computed
+  the cache age without the `isinstance` guard `status` already used, so a null
+  `fetched_at` raised before the first `print` — and the module's never-raise
+  contract turned the one command whose whole job is to report status into zero
+  output.
 
 ## [0.6.1] — 2026-07-26
 
