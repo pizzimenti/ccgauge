@@ -4,6 +4,44 @@ All notable changes to ccgauge are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); this project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.8.0] — 2026-07-28
+
+### Changed
+
+- **`./install.sh` now installs the whole thing, not half of it.** It also
+  copies a complete status line (`statusline.sh`) and registers it in
+  `settings.json` alongside the `UserPromptSubmit` hook. Previously the
+  installer set up only the hook and left the status line — the part you
+  actually look at — as a manual step against an example file, so a fresh
+  machine needed hand-editing before the gauges appeared anywhere. `git clone
+  && ./install.sh` is now the entire install, and `git pull && ./install.sh`
+  the entire update.
+- **The installer verifies its own work and fails loudly.** It checks that the
+  files are present and executable, that `usage.py` runs, that every mode exits
+  cleanly, that `settings.json` is still valid JSON with both entries
+  registered, and that the hook and status line each render real output —
+  exiting non-zero with a specific message and a command to reproduce the
+  problem. Credentials and endpoint reachability are warnings rather than
+  failures, since neither a container nor a logged-out CLI is a broken install.
+
+  This exists because `usage.py` deliberately swallows its own errors so it can
+  never disrupt a hook or a status line. The cost of that guarantee is that a
+  half-finished install presents as a *blank gauge* rather than a complaint;
+  the installer is the one place allowed to be loud about it.
+- **`./install.sh --check`** re-runs the verification against an existing
+  install without changing anything.
+- An existing `statusLine` is replaced rather than left alone, but the
+  installer prints exactly what it replaced and the previous `settings.json` is
+  kept at `settings.json.bak`. The README documents how to keep your own status
+  line instead.
+
+### Removed
+
+- **`statusline-snippet.sh`**, superseded by `statusline.sh`. It was a toy
+  example that existed only because the installer would not configure a status
+  line itself; shipping both a real one and an example invited exactly the
+  confusion of not knowing which one was live.
+
 ## [0.7.0] — 2026-07-28
 
 ### Added

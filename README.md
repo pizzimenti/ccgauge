@@ -36,19 +36,52 @@ cd ~/Code/ccgauge
 ./install.sh
 ```
 
-The installer copies `usage.py` and `hooks/usage-line.sh` into your Claude
-config dir (`~/.claude`, or `$CLAUDE_CONFIG_DIR`), and registers the
-`UserPromptSubmit` hook in `settings.json` (idempotently, with a `.bak`
-backup). Then:
+That's the whole install. Restart Claude Code (or start a new session) and both
+halves are live. Requires `python3` — standard library only, no `pip install`,
+no `jq`.
 
-1. **Verify:** `python3 ~/.claude/usage.py show`
-2. **Status line:** append the usage fragment to your status line — see
-   [`statusline-snippet.sh`](./statusline-snippet.sh). The one call you add,
-   `python3 ~/.claude/usage.py status`, only reads the cache, so it is safe to
-   run on every render.
-3. **Restart** Claude Code (or start a new session) so the hook loads.
+The installer copies three files into your Claude config dir (`~/.claude`, or
+`$CLAUDE_CONFIG_DIR`) and registers both of them in `settings.json`,
+idempotently and with a `.bak`:
 
-Requires `python3` (standard library only — no `pip install`, no `jq`).
+| | |
+| :-- | :-- |
+| `usage.py` | the probe and renderer |
+| `hooks/usage-line.sh` | the `UserPromptSubmit` hook — puts usage in the assistant's context |
+| `statusline.sh` | the status line — puts the gauges on your screen |
+
+**Then it proves the install works**, and exits non-zero with a specific message
+if any part of it doesn't: that the files are present and executable, that
+`usage.py` runs, that every one of its modes exits cleanly, that `settings.json`
+is still valid JSON with both entries registered, and that the hook and status
+line each render real output. Only credentials and network reachability are
+treated as warnings, since neither a container nor a logged-out CLI is a broken
+install.
+
+That verification is the point. `usage.py` deliberately swallows its own errors
+so it can never disrupt a hook or a status line, which means a half-finished
+install shows up as a *blank gauge* rather than a complaint. The installer is
+the one place allowed to be loud.
+
+```sh
+git pull && ./install.sh   # update — same command
+./install.sh --check       # verify an existing install, change nothing
+```
+
+### If you already have a status line
+
+The installer replaces it, tells you exactly what it replaced, and leaves the
+previous `settings.json` at `settings.json.bak`. To keep your own instead,
+restore that backup and add one call to your existing status line:
+
+```sh
+python3 "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/usage.py" status
+```
+
+That call only reads ccgauge's cache — no network — so it is safe to run on
+every render. Use `status plain` instead if you want to colour the fragment
+yourself; it emits no ANSI at all. Either way,
+[`statusline.sh`](./statusline.sh) is a working reference.
 
 ## How it works
 
