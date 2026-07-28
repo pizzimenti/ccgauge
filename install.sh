@@ -80,13 +80,16 @@ if [ "$CHECK_ONLY" -eq 0 ]; then
   # Register the UserPromptSubmit hook and the status line. Both are idempotent;
   # an existing statusLine pointing elsewhere is reported (loudly) rather than
   # replaced silently, and the .bak above is the way back.
-  HOOK_CMD="$HOOK_DST" STATUSLINE_CMD="bash $STATUSLINE_DST" \
+  HOOK_CMD="$HOOK_DST" STATUSLINE_PATH="$STATUSLINE_DST" \
   python3 - "$SETTINGS" <<'PY'
-import json, os, sys
+import json, os, shlex, sys
 
 path = sys.argv[1]
 hook_cmd = os.environ["HOOK_CMD"]
-statusline_cmd = os.environ["STATUSLINE_CMD"]
+# shlex.quote, because settings.json stores a *shell command string*: a
+# CLAUDE_CONFIG_DIR containing a space would otherwise be split into two
+# arguments and bash would try to open the first half.
+statusline_cmd = "bash " + shlex.quote(os.environ["STATUSLINE_PATH"])
 
 with open(path) as fh:
     cfg = json.load(fh)
@@ -139,7 +142,13 @@ else
 fi
 
 # Its never-raise contract: every mode must exit 0 even with no cache at all.
-for mode in refresh status show log; do
+#
+# `show` is deliberately NOT in this loop. It is the one mode that calls
+# refresh(force=True), bypassing the cache TTL, and the endpoint 429s hard when
+# polled too fast — an installer that fires it once per verification step would
+# trip the exact rate limit the tool exists to respect. It is run once, below,
+# and its output reused.
+for mode in refresh status log; do
   if python3 "$USAGE_DST" "$mode" > /dev/null 2>&1 < /dev/null; then
     ok "usage.py $mode exits cleanly"
   else
@@ -147,13 +156,15 @@ for mode in refresh status show log; do
   fi
 done
 
-# One pass over settings.json: prints its own findings, and exits non-zero only
-# for the one condition that is genuinely broken (an unregistered hook), so the
-# shell can fold that into the failure count.
+# One pass over settings.json: prints its own findings and exits non-zero on the
+# conditions that mean the install is incomplete, so the shell can fold that into
+# the failure count. A status line pointing somewhere *else* is a warning rather
+# than a failure — the README documents keeping your own — but no status line at
+# all means half of ccgauge has nowhere to render.
 settings_report=$(
   SETTINGS="$SETTINGS" HOOK_DST="$HOOK_DST" STATUSLINE_DST="$STATUSLINE_DST" \
   python3 <<'PY'
-import json, os, sys
+import json, os, shlex, sys
 
 G, Y, R, X = "\033[0;32m", "\033[0;33m", "\033[0;31m", "\033[0m"
 try:
@@ -172,19 +183,28 @@ print(f"  {G}ok{X}    UserPromptSubmit hook is registered" if registered
       else f"  {R}FAIL{X}  UserPromptSubmit hook is NOT registered")
 
 cmd = (cfg.get("statusLine") or {}).get("command") or ""
-if sl in cmd:
+# Match the path however it was quoted: shlex.split understands both the quoted
+# form we write and an unquoted one a user may have typed by hand.
+try:
+    words = shlex.split(cmd)
+except ValueError:
+    words = cmd.split()
+ours = sl in words
+if ours:
     print(f"  {G}ok{X}    status line is registered")
 elif cmd:
     print(f"  {Y}warn{X}  status line points elsewhere: {cmd}")
+    print( "        (fine if that is deliberate — see the README)")
 else:
-    print(f"  {Y}warn{X}  no status line configured")
+    print(f"  {R}FAIL{X}  no status line configured — the gauges have nowhere to render")
+    print( "        re-run ./install.sh without --check")
 
-sys.exit(0 if registered else 1)
+sys.exit(0 if registered and (ours or cmd) else 1)
 PY
 ) && settings_ok=1 || settings_ok=0
 printf '%s\n' "$settings_report"
 [ "$settings_ok" -eq 1 ] || \
-  fail "settings.json is unreadable, or is missing the UserPromptSubmit hook"
+  fail "settings.json is unreadable, or is missing the hook or the status line"
 
 # The hook and the status line must both produce output for a realistic payload.
 SAMPLE='{"workspace":{"current_dir":"'"$PWD"'"},"model":{"display_name":"Test"},"context_window":{"used_percentage":31.4},"session_id":"install-check"}'
@@ -206,9 +226,12 @@ fi
 # logged-out CLI, is not a broken install. Report, don't fail.
 if [ -r "$CONFIG_DIR/.credentials.json" ]; then
   ok "OAuth credentials readable"
-  if python3 "$USAGE_DST" show 2>/dev/null | grep -q '%'; then
+  # Exactly one forced refresh per run, its output reused for both the check and
+  # the display. See the note on the mode loop above.
+  show_out=$(python3 "$USAGE_DST" show 2>/dev/null || true)
+  if printf '%s' "$show_out" | grep -q '%'; then
     ok "endpoint reachable — live numbers below"
-    python3 "$USAGE_DST" show 2>/dev/null | sed 's/^/        /'
+    printf '%s\n' "$show_out" | sed 's/^/        /'
   else
     warn "could not read live usage yet (endpoint, rate limit, or token refresh)"
     warn "this is normal right after install; check again with: ./install.sh --check"
