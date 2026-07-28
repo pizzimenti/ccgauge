@@ -40,9 +40,22 @@ That's the whole install. Restart Claude Code (or start a new session) and both
 halves are live. Requires `python3` — standard library only, no `pip install`,
 no `jq`.
 
+### Platform support
+
+| | |
+| :-- | :-- |
+| **Linux** | Supported and developed on. |
+| **Windows** | Should work, but **needs [Git for Windows](https://git-scm.com/downloads/win)** — Claude Code runs hooks and the status line through Git Bash when it's installed and PowerShell when it isn't, and these are bash scripts. Untested; reports welcome. |
+| **macOS** | **Not supported.** Claude Code stores its OAuth token in the macOS Keychain rather than in `~/.claude/.credentials.json` ([docs](https://code.claude.com/docs/en/authentication)), so there is no file for ccgauge to read and no amount of logging in will create one. Reading the Keychain isn't implemented. |
+
+The installer detects all three and says so up front rather than letting you
+discover it as a permanently blank gauge — on macOS it fails outright.
+
+### What it installs
+
 The installer copies three files into your Claude config dir (`~/.claude`, or
 `$CLAUDE_CONFIG_DIR`) and registers both of them in `settings.json`,
-idempotently and with a `.bak`:
+idempotently and with a timestamped backup:
 
 | | |
 | :-- | :-- |

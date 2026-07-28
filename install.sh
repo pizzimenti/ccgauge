@@ -56,6 +56,30 @@ else
   warn "claude CLI not on PATH — usage.py will fall back to its pinned User-Agent"
 fi
 
+# Platform. ccgauge reads the OAuth token straight off disk, and Claude Code only
+# keeps it there on Linux and Windows — on macOS it lives in the Keychain, so
+# there is no file for us to read and no amount of logging in will create one.
+# Say so plainly here rather than letting the credentials check further down
+# report a missing file and send you off to re-authenticate for nothing.
+PLATFORM="$(uname -s 2>/dev/null || echo unknown)"
+case "$PLATFORM" in
+  Linux)  ok "platform: Linux" ;;
+  Darwin)
+    fail "platform: macOS — not supported yet"
+    printf '        Claude Code stores its OAuth token in the macOS Keychain, not in\n'
+    printf '        %s/.credentials.json, so ccgauge cannot read it.\n' "$CONFIG_DIR"
+    printf '        Reading the Keychain is not implemented. Nothing below will show\n'
+    printf '        live numbers on this machine.\n'
+    ;;
+  MINGW*|MSYS*|CYGWIN*)
+    ok "platform: Windows (Git Bash)"
+    warn "Claude Code runs hooks and the status line through Git Bash when it is"
+    warn "installed and PowerShell when it is not — these are bash scripts, so keep"
+    warn "Git for Windows installed or they will not run"
+    ;;
+  *) warn "platform: $PLATFORM — untested; ccgauge is developed on Linux" ;;
+esac
+
 # --------------------------------------------------------------------------- #
 # install
 # --------------------------------------------------------------------------- #
@@ -249,6 +273,11 @@ if [ -r "$CONFIG_DIR/.credentials.json" ]; then
     warn "could not read live usage yet (endpoint, rate limit, or token refresh)"
     warn "this is normal right after install; check again with: ./install.sh --check"
   fi
+elif [ "$PLATFORM" = "Darwin" ]; then
+  # Already failed loudly up top; don't repeat the advice to log in, which would
+  # be wrong here — the file is absent by design on macOS, not because you're
+  # logged out.
+  warn "no credentials file (expected on macOS — see the platform note above)"
 else
   warn "no $CONFIG_DIR/.credentials.json — log in with the claude CLI, then re-run --check"
 fi

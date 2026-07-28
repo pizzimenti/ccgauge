@@ -40,6 +40,16 @@ All notable changes to ccgauge are documented here. Format follows
   to the modified file — has destroyed the only copy of your original. Nothing
   now overwrites an existing backup, and a no-op run writes none at all.
 
+- **The installer reports what platform you are on, and refuses macOS.** Claude
+  Code stores its OAuth token in the macOS Keychain rather than in
+  `~/.claude/.credentials.json`, so there is no file for ccgauge to read and no
+  amount of logging in will create one. It now fails outright there with that
+  explanation, instead of installing cleanly and leaving a permanently blank
+  gauge behind a warning that told you to re-authenticate — advice that could
+  never have helped. Windows (Git Bash) installs with a warning that Git for
+  Windows is required, since Claude Code falls back to PowerShell without it and
+  these are bash scripts. Linux is unchanged.
+
 ### Removed
 
 - **`statusline-snippet.sh`**, superseded by `statusline.sh`. It was a toy
