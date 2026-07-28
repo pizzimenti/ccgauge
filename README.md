@@ -77,19 +77,25 @@ install shows up as a *blank gauge* rather than a complaint. The installer is
 the one place allowed to be loud.
 
 ```sh
-git pull && ./install.sh   # update — same command
-./install.sh --check       # verify an existing install, change nothing
+git pull && ./install.sh    # update — same command
+./install.sh --check        # verify; makes no network call and mutates nothing
+./install.sh --statusline   # take over a status line you already have
 ```
+
+`--check` is safe to run repeatedly, including while you're diagnosing a
+rate-limit problem: it skips the two things that would reach the endpoint (the
+forced refresh, and executing the hook — which detaches a background refresh of
+its own), and reports cache age instead. Firing a request to diagnose a lockout
+is how you extend one.
 
 ### If you already have a status line
 
-The installer replaces it, tells you exactly what it replaced, and names the
-backup it just wrote. Backups are timestamped (`settings.json.20260728-151559.bak`)
-and are only written on a run that actually changes something, so nothing ever
-overwrites an earlier one and a repeat run leaves no litter — you can always get
-back to what you had.
+**The installer leaves it alone.** It tells you what it found and stops there,
+because replacing it by default would mean the documented "keep your own" setup
+couldn't survive the documented `git pull && ./install.sh` update — every update
+would silently clobber it again.
 
-To keep your own status line instead, restore that backup and add one call to it:
+Add ccgauge to your own status line with one call:
 
 ```sh
 python3 "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/usage.py" status
@@ -99,6 +105,11 @@ That call only reads ccgauge's cache — no network — so it is safe to run on
 every render. Use `status plain` instead if you want to colour the fragment
 yourself; it emits no ANSI at all. Either way,
 [`statusline.sh`](./statusline.sh) is a working reference.
+
+Or hand yours over with `./install.sh --statusline`, which backs up the previous
+`settings.json` to a timestamped file first. Backups are only written on a run
+that actually changes something, so nothing ever overwrites an earlier one and a
+repeat run leaves no litter — you can always get back to what you had.
 
 ## How it works
 

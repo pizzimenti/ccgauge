@@ -30,9 +30,18 @@ All notable changes to ccgauge are documented here. Format follows
   the installer is the one place allowed to be loud about it.
 - **`./install.sh --check`** re-runs the verification against an existing
   install without changing anything.
-- An existing `statusLine` is replaced rather than left alone, but the
-  installer prints exactly what it replaced and names the backup it wrote. The
-  README documents how to keep your own status line instead.
+- **An existing `statusLine` is left alone.** The installer reports what it
+  found and tells you how to add ccgauge to it, or to hand it over with
+  `./install.sh --statusline`. Replacing it by default would have meant the
+  documented "keep your own" setup could not survive the documented `git pull
+  && ./install.sh` update — every update would silently clobber it again.
+  Registration also now sets only the two keys it owns, so sibling keys in an
+  existing `statusLine` block survive.
+- **`--check` reaches the network no more than `git status` does.** It skips
+  the forced refresh and does not execute the hook (which detaches a background
+  refresh of its own), reporting cache age instead. It has to stay safe to run
+  repeatedly while diagnosing a rate-limit problem — firing a request to
+  diagnose a lockout is how you extend one.
 - **Backups of `settings.json` are timestamped and written only when something
   actually changes.** A single fixed `settings.json.bak` rewritten on every run
   is a trap: install, notice your status line changed, re-run the installer
@@ -48,7 +57,9 @@ All notable changes to ccgauge are documented here. Format follows
   gauge behind a warning that told you to re-authenticate — advice that could
   never have helped. Windows (Git Bash) installs with a warning that Git for
   Windows is required, since Claude Code falls back to PowerShell without it and
-  these are bash scripts. Linux is unchanged.
+  these are bash scripts. Linux is unchanged. On macOS it exits *before* copying
+  or registering anything, rather than installing a gauge that can never
+  populate and only then reporting the platform unsupported.
 
 ### Removed
 

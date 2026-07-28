@@ -53,14 +53,30 @@ ctx_str=""
 if [ -n "$used_pct" ]; then
   # LC_NUMERIC=C so printf parses the JSON float (dot decimal) regardless of
   # locale — a comma-decimal locale would otherwise error on "11.5".
-  used_int=$(LC_NUMERIC=C printf "%.0f" "$used_pct" 2>/dev/null || echo "")
+  #
+  # The result is validated rather than trusted: bash's printf writes "0" to
+  # stdout *before* returning non-zero on a bad conversion, so a `|| echo ""`
+  # fallback never fires and an unparseable percentage would render as a
+  # confident, fabricated `ctx 0%`. Better to show no indicator than a wrong one.
+  if used_int=$(LC_NUMERIC=C printf "%.0f" "$used_pct" 2>/dev/null); then
+    case "$used_int" in
+      ''|*[!0-9]*) used_int="" ;;   # negative, or something unexpected
+    esac
+  else
+    used_int=""                      # conversion failed; "0" on stdout is a lie
+  fi
   if [ -n "$used_int" ]; then
-    if   [ "$used_int" -ge 90 ]; then color="\033[0;31m"   # red
-    elif [ "$used_int" -ge 70 ]; then color="\033[0;33m"   # yellow
-    else                               color="\033[0;32m"  # green
+    # Omit the whole segment if the bar can't be produced, rather than rendering
+    # a bar-less `ctx  31%` — a missing usage.py should read as "not installed",
+    # not as a subtly malformed gauge.
+    ctx_bar=$(python3 "$USAGE_PY" bar "$used_int" 2>/dev/null || true)
+    if [ -n "$ctx_bar" ]; then
+      if   [ "$used_int" -ge 90 ]; then color="\033[0;31m"   # red
+      elif [ "$used_int" -ge 70 ]; then color="\033[0;33m"   # yellow
+      else                               color="\033[0;32m"  # green
+      fi
+      ctx_str=" ${color}ctx ${ctx_bar} ${used_int}%\033[0m"
     fi
-    ctx_bar=$(python3 "$USAGE_PY" bar "$used_int" 2>/dev/null)
-    ctx_str=" ${color}ctx ${ctx_bar} ${used_int}%\033[0m"
   fi
 fi
 
