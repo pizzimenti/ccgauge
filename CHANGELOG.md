@@ -7,6 +7,7 @@ All notable changes to ccgauge are documented here. Format follows
 ## [0.7.0] — 2026-07-28
 
 ### Added
+
 - **Pace shadow on every gauge.** Each bar now draws the point where an
   evenly-paced spend would sit right now, derived from how much of the window
   has elapsed — half-way through the 5-hour window (2.5h in), the mark is at
@@ -17,7 +18,7 @@ All notable changes to ccgauge are documented here. Format follows
   `█`+`▒` is where the mark sits. A percentage alone couldn't tell you whether
   40% used was comfortable or alarming; now the gauge does.
 
-  ```
+  ```text
   5h [██▒▒▒░░░░░] 20%(2.5h)   half-way in, a fifth spent — three segments of headroom
   5h [████▓▓░░░░] 60%(2.4h)   pace is at 40%, so two segments are past the mark
   5h [█████░░░░░] 50%(2.5h)   exactly on pace: no shadow at all
@@ -39,6 +40,7 @@ All notable changes to ccgauge are documented here. Format follows
   exists.
 
 ### Changed
+
 - **Bars are sized so one segment is a round slice of wall-clock time.** The
   5-hour bar keeps its 10 segments (half an hour each) and the **7-day bar is
   now 14** (half a day each), so the pace mark reads as a position *in the
@@ -86,6 +88,7 @@ All notable changes to ccgauge are documented here. Format follows
   snippet's `ctx` bar needs none of the scheme's colours.
 
 ### Fixed
+
 - **A window whose percentage is missing no longer renders as 0% used.** A
   partial API response leaves one window's `utilization` absent while its
   `resets_at` still lands in the cache; `show` drew a bar for it anyway, and

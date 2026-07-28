@@ -39,6 +39,7 @@ Modes (argv[1]):
     log [N]             -- print the last N history events (default 20)
 """
 
+import contextlib
 import json
 import math
 import os
@@ -772,9 +773,12 @@ def _bar(pct, cells=10, pace=None, ansi=False):
     measuring the fragment's display width needs.
     """
     used = _cells(pct, cells)
-    # An unusable pace means *no mark*, not a mark at zero: falling back to zero
-    # would draw the whole spend as overspend, turning a bad input into an alarm.
-    mark = None if _finite(pace) is None else _cells(pace, cells)
+    # An unusable value on *either* side means no mark at all, never a mark at
+    # zero. Both fallbacks would have the bar assert something about a number it
+    # does not have: an unusable pace draws the whole spend as overspend, and an
+    # unusable percentage draws the entire pace mark as untouched headroom.
+    mark = (None if _finite(pct) is None or _finite(pace) is None
+            else _cells(pace, cells))
     if mark is None or mark == used:
         head, mid, tail = used, "", cells - used
     elif mark > used:
@@ -874,10 +878,13 @@ def cmd_show():
         ansi = False
 
     def row(label, pct, reset_iso, window, cells):
-        if pct is None:
-            # No bar at all: _cells() coerces None to zero, so drawing one would
-            # assert "nothing spent, all this headroom" about a number we do not
-            # have — and the bar is the more legible of the two claims.
+        if _finite(pct) is None:
+            # No bar at all: _cells() coerces an unusable value to zero, so
+            # drawing one would assert "nothing spent, all this headroom" about a
+            # number we do not have — and the bar is the more legible of the two
+            # claims. Checked with _finite rather than `is None` so a malformed
+            # cache holding a string or a NaN takes this path too, instead of
+            # reaching the subtraction below and raising.
             return f"  {label}: no data — resets {fmt_reset(reset_iso)}"
         pace = pace_for(reset_iso, window, age)
         line = (f"  {label}: {_bar(pct, cells=cells, pace=pace, ansi=ansi)} {pct}% used"
@@ -962,10 +969,9 @@ def main():
             if len(sys.argv) > 2:
                 pace = None
                 if len(sys.argv) > 3:
-                    try:
+                    # unparseable shadow: draw the bar without one
+                    with contextlib.suppress(ValueError):
                         pace = float(sys.argv[3])
-                    except ValueError:
-                        pass  # unparseable shadow: draw the bar without one
                 try:
                     # Colour only once a pace mark is in play: a bare value has
                     # nothing to warn about, and callers already wrap it in a

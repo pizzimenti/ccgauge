@@ -17,7 +17,7 @@ It reads the OAuth token Claude Code already stores on disk, queries the
 (undocumented) usage endpoint, and caches the result. No API key, no password,
 no browser — and the token never leaves your machine.
 
-```
+```text
 ~ ctx:10% Opus 4.8 (1M context) 5h [█▒▒░░░░░░░] 11%(3.7h) 7d [▒▒▒▒░░░░░░░░░░] 3%(5.2d)
                                  └──────────────────────────────────────────────────┘ ccgauge
 ```
@@ -193,7 +193,7 @@ The mark is drawn as a shadow *behind* the fill, using two extra shades:
 Only one of `▒`/`▓` is ever present, and the reading works both directions:
 `█`+`▓` is always what you've used, `█`+`▒` is always where the pace mark sits.
 
-```
+```text
 5h [██▒▒▒░░░░░] 20%(2.5h)   half-way in, only a fifth spent — three segments of headroom
 5h [████▓▓░░░░] 60%(2.4h)   pace is at 40%, so two segments are past the mark
 5h [█████░░░░░] 50%(2.5h)   exactly on pace: no shadow at all
