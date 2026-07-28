@@ -31,9 +31,14 @@ All notable changes to ccgauge are documented here. Format follows
 - **`./install.sh --check`** re-runs the verification against an existing
   install without changing anything.
 - An existing `statusLine` is replaced rather than left alone, but the
-  installer prints exactly what it replaced and the previous `settings.json` is
-  kept at `settings.json.bak`. The README documents how to keep your own status
-  line instead.
+  installer prints exactly what it replaced and names the backup it wrote. The
+  README documents how to keep your own status line instead.
+- **Backups of `settings.json` are timestamped and written only when something
+  actually changes.** A single fixed `settings.json.bak` rewritten on every run
+  is a trap: install, notice your status line changed, re-run the installer
+  while working out how to undo it, and the second run's backup — now identical
+  to the modified file — has destroyed the only copy of your original. Nothing
+  now overwrites an existing backup, and a no-op run writes none at all.
 
 ### Removed
 

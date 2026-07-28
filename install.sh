@@ -74,15 +74,18 @@ if [ "$CHECK_ONLY" -eq 0 ]; then
     printf '{\n  "hooks": {}\n}\n' > "$SETTINGS"
     ok "created $SETTINGS"
   fi
-  cp "$SETTINGS" "$SETTINGS.bak"
-  ok "backed up settings.json -> settings.json.bak"
 
-  # Register the UserPromptSubmit hook and the status line. Both are idempotent;
-  # an existing statusLine pointing elsewhere is reported (loudly) rather than
-  # replaced silently, and the .bak above is the way back.
+  # Register the UserPromptSubmit hook and the status line, backing up first.
+  #
+  # The backup is timestamped and is written ONLY on a run that actually changes
+  # something. A single fixed settings.json.bak overwritten every run is a trap:
+  # install, notice your status line changed, re-run the installer while working
+  # out how to undo it, and the second run's backup — now identical to the
+  # modified file — has destroyed the only copy of your original. Nothing here
+  # ever overwrites an existing backup, and a no-op run leaves no litter.
   HOOK_CMD="$HOOK_DST" STATUSLINE_PATH="$STATUSLINE_DST" \
   python3 - "$SETTINGS" <<'PY'
-import json, os, shlex, sys
+import datetime, json, os, shlex, shutil, sys
 
 path = sys.argv[1]
 hook_cmd = os.environ["HOOK_CMD"]
@@ -90,33 +93,43 @@ hook_cmd = os.environ["HOOK_CMD"]
 # CLAUDE_CONFIG_DIR containing a space would otherwise be split into two
 # arguments and bash would try to open the first half.
 statusline_cmd = "bash " + shlex.quote(os.environ["STATUSLINE_PATH"])
+G, Y, X = "\033[0;32m", "\033[0;33m", "\033[0m"
 
 with open(path) as fh:
-    cfg = json.load(fh)
+    original = fh.read()
+cfg = json.loads(original)
 
 groups = cfg.setdefault("hooks", {}).setdefault("UserPromptSubmit", [])
-registered = any(h.get("command") == hook_cmd
-                 for g in groups for h in g.get("hooks", []))
-if registered:
-    print("  \033[0;32mok\033[0m    UserPromptSubmit hook already registered")
+if any(h.get("command") == hook_cmd for g in groups for h in g.get("hooks", [])):
+    print(f"  {G}ok{X}    UserPromptSubmit hook already registered")
 else:
     groups.append({"hooks": [{"type": "command", "command": hook_cmd}]})
-    print("  \033[0;32mok\033[0m    registered UserPromptSubmit hook")
+    print(f"  {G}ok{X}    registered UserPromptSubmit hook")
 
 current = (cfg.get("statusLine") or {}).get("command")
+replacing = current if current and current != statusline_cmd else None
 if current == statusline_cmd:
-    print("  \033[0;32mok\033[0m    status line already registered")
+    print(f"  {G}ok{X}    status line already registered")
 else:
-    if current:
-        print(f"  \033[0;33mwarn\033[0m  replacing your existing status line:")
-        print(f"          {current}")
-        print( "          the previous settings.json is at settings.json.bak")
     cfg["statusLine"] = {"type": "command", "command": statusline_cmd}
-    print("  \033[0;32mok\033[0m    registered status line")
+    print(f"  {G}ok{X}    registered status line")
+
+updated = json.dumps(cfg, indent=2) + "\n"
+if updated == original:
+    print(f"  {G}ok{X}    settings.json already correct — not rewritten")
+    sys.exit(0)
+
+stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+backup = f"{path}.{stamp}.bak"
+shutil.copy2(path, backup)
+print(f"  {G}ok{X}    backed up settings.json -> {os.path.basename(backup)}")
+if replacing:
+    print(f"  {Y}warn{X}  replaced your existing status line:")
+    print(f"          {replacing}")
+    print(f"          restore it from {os.path.basename(backup)}")
 
 with open(path, "w") as fh:
-    json.dump(cfg, fh, indent=2)
-    fh.write("\n")
+    fh.write(updated)
 PY
 fi
 
@@ -171,7 +184,7 @@ try:
     cfg = json.load(open(os.environ["SETTINGS"]))
 except Exception as exc:
     print(f"  {R}FAIL{X}  settings.json is not valid JSON ({exc})")
-    print("        restore it from settings.json.bak")
+    print("        restore it from the newest settings.json.*.bak beside it")
     sys.exit(1)
 print(f"  {G}ok{X}    settings.json is valid JSON")
 

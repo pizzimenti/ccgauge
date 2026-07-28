@@ -70,9 +70,13 @@ git pull && ./install.sh   # update — same command
 
 ### If you already have a status line
 
-The installer replaces it, tells you exactly what it replaced, and leaves the
-previous `settings.json` at `settings.json.bak`. To keep your own instead,
-restore that backup and add one call to your existing status line:
+The installer replaces it, tells you exactly what it replaced, and names the
+backup it just wrote. Backups are timestamped (`settings.json.20260728-151559.bak`)
+and are only written on a run that actually changes something, so nothing ever
+overwrites an earlier one and a repeat run leaves no litter — you can always get
+back to what you had.
+
+To keep your own status line instead, restore that backup and add one call to it:
 
 ```sh
 python3 "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/usage.py" status
