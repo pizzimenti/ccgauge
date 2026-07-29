@@ -4,6 +4,73 @@ All notable changes to ccgauge are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); this project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.8.1] — 2026-07-29
+
+Fixes from an adversarial three-lens review of 0.8.0 (Windows/CRT semantics,
+the never-raise/never-hang contract, PowerShell on both engines), every
+mechanism re-verified empirically on Windows 11.
+
+### Fixed
+
+- **The `claude --version` probe can no longer hang a prompt past its
+  timeout.** `subprocess.run(timeout=5)` is not a hard bound on Windows: on
+  timeout it kills the direct child — for an npm install that's the
+  `claude.cmd` shim's `cmd.exe` — then re-reads the pipes with *no* timeout,
+  and the shim's `node` grandchild, still holding the inherited write
+  handles, blocks that read until it exits (reproduced: a stalling shim held
+  a "5s" probe for 8s; an AV-wedged one could hold a prompt for a minute).
+  The probe now uses `Popen` + `communicate(timeout=5)` and on expiry kills
+  and *abandons* — the reader threads are daemonic — falling back to the
+  pinned UA.
+- **A `claude` binary planted in the project directory is never executed.**
+  Hooks run with cwd inside the user's project, and `shutil.which` on
+  Windows searches the cwd first on Python < 3.12 (and on 3.12+ where the
+  machine config asks for it). A cwd-resolved `claude` is now rejected and
+  the probe skipped — the pinned UA beats running untrusted content.
+- **One bad cache value can no longer silence the gauge permanently.**
+  `hookline` ran `line` and the detached cache-warmer under one exception
+  umbrella, so a raise inside `line` (e.g. a cache with a non-numeric
+  `fetched_at`, which also crashed the pre-refresh age check — both fixed)
+  skipped the warm-refresh too; since `line` raised before ever fetching,
+  nothing would ever repair the cache. The two now fail independently,
+  matching the two-process POSIX wrapper.
+- **`statusline` renders the gauges even when the payload is malformed.**
+  A wrong-*typed* field (`"workspace"` as a string, `"context_window"` as a
+  list) blanked the entire status line, gauges included, though they need
+  nothing from the payload. Every extraction is now type-checked; a bad
+  field just doesn't render, as the contract says.
+- **`usage.py log` no longer claims "no events recorded yet" when it merely
+  lost the lock race** (Windows byte-range locks are mandatory, so an
+  unlocked read of a locked log raises). It now says the log is briefly
+  unreadable and to retry — and only reports "no events" for a genuinely
+  absent log.
+- **`.credentials.json` is read as UTF-8 (BOM tolerated)** instead of the
+  locale code page, and non-dict JSON in it degrades to "no token" instead
+  of an (absorbed) crash. `~`-abbreviation now also survives a trailing
+  separator on a hand-set `USERPROFILE`/`HOME`, and declines to abbreviate
+  a drive-root HOME. If a stream's UTF-8 reconfigure itself fails, output
+  degrades to `?`-for-glyph rather than an invisible encoding error.
+- **`install.ps1`: the hook matcher is precise, migrations are loud, and
+  bad states fail before the backup is touched.** The old matcher claimed
+  any command containing `usage.py` plus ` line` anywhere (reproduced
+  destroying an unrelated hook); it now requires the mode as the token
+  immediately after `usage.py` (or a trailing `usage-line.sh`). Every
+  replaced command is printed. settings.json is validated *before* the
+  `.bak` is overwritten, so broken JSON can't clobber a good backup (and
+  the error says so, without a traceback). A BOM'd settings.json is read
+  correctly (`utf-8-sig`); writes keep LF line endings so a dotfiles-synced
+  file doesn't churn to CRLF; a stale ccgauge sibling next to an exact match
+  is now also rewritten instead of left to double-inject the `[usage]`
+  line; `-LiteralPath` throughout for bracket-safe paths; non-object
+  `hooks`/`UserPromptSubmit` shapes are refused cleanly.
+
+### Changed
+
+- **`urllib` is imported only when a fetch actually happens.** It drags in
+  the whole `http`/`email` stack — ~80–110 ms, half the start-up of the
+  read-only modes on Windows — and `status`/`statusline` run on every
+  status-line repaint.
+
 ## [0.8.0] — 2026-07-29
 
 ### Added

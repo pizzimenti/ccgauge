@@ -73,9 +73,14 @@ python "C:/Users/you/.claude/usage.py" hookline
 `usage-line.sh` does, with no bash on the path. The forward slashes are
 deliberate: Claude Code on Windows runs hook and status-line commands through
 Git Bash when it is installed and PowerShell otherwise, and that spelling
-survives both. Then:
+survives both. Re-running the installer is safe: an existing ccgauge
+registration — including a POSIX `usage-line.sh` one from a synced
+settings.json — is rewritten in place (and each replacement is printed)
+rather than accumulating duplicates. Then:
 
-1. **Verify:** `python "$env:USERPROFILE\.claude\usage.py" show`
+1. **Verify:** `python "$env:USERPROFILE\.claude\usage.py" show` — substitute
+   the interpreter the installer said it picked (`py -3` on machines where
+   `python` is only the Store stub); its final output shows the exact command.
 2. **Status line:** `usage.py statusline` renders a complete example status
    line — cwd, model, context bar, usage gauges — from the JSON Claude Code
    pipes in, one Python process per render:
