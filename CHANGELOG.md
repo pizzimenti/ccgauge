@@ -4,6 +4,60 @@ All notable changes to ccgauge are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); this project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.8.0] — 2026-07-29
+
+### Added
+
+- **Native Windows 11 support.** The same `usage.py`, the same cache files, the
+  same `%USERPROFILE%\.claude\.credentials.json` token Claude Code already
+  writes on Windows — no WSL, no bash. What it took:
+  - **`usage.py hookline`** — the hook in one command: `line`, then a detached
+    background `refresh` spawned by `usage.py` itself (`DETACHED_PROCESS` on
+    Windows, its own session on POSIX), replacing `usage-line.sh`'s `&`/`disown`
+    on platforms that don't have it. This is what the Windows installer
+    registers.
+  - **`usage.py statusline`** — a complete example status line (cwd, model,
+    context bar, usage gauges) rendered from the status-line JSON on stdin.
+    One Python process per render; no bash, and none of the ~200 ms a
+    PowerShell start-up would cost on every repaint. Works on POSIX too.
+  - **`install.ps1`** — the installer as a PowerShell twin of `install.sh`
+    (Windows PowerShell 5.1 and pwsh 7+): finds a *working* Python 3 (`python`
+    / `py -3` / `python3`, each actually run, because a stock Windows `python`
+    is the Microsoft Store stub), copies `usage.py`, and registers the hook
+    idempotently with the same `.bak` backup. The generated command uses
+    forward slashes and plain double quotes so it parses identically under
+    Git Bash and PowerShell — whichever Claude Code picks.
+  - **Real locking on Windows.** The refresh lock and the history-log lock,
+    previously `fcntl`-only (Windows silently ran unlocked), now fall back to
+    `msvcrt` byte-range locks with the same semantics: non-blocking contention
+    for the refresh lock, OS-released on process death, and a bounded ~1 s
+    retry for the log (past which it degrades to an unlocked append rather
+    than stall a prompt). The log lock matters *more* on Windows: POSIX
+    `O_APPEND` writes are atomic on their own; the CRT's append emulation is
+    a seek-then-write, which isn't.
+  - **UTF-8 stdio + ANSI on legacy consoles.** Piped stdout on Windows
+    defaults to the ANSI code page (cp1252), which cannot encode `█ ▒ ▓ ░ ⚠`
+    — and under the never-raise contract that error would surface as a
+    silently blank gauge. `usage.py` now re-encodes piped stdio to UTF-8
+    (what Claude Code decodes on every platform) and enables
+    virtual-terminal processing on legacy conhost, where Windows Terminal
+    needs nothing.
+  - **`claude --version` found through its npm shim.** `claude` on Windows is
+    typically a `claude.cmd` shim, which a bare `CreateProcess` PATH search
+    never finds; the User-Agent probe now resolves the CLI with
+    `shutil.which` (honours `PATHEXT`) and runs it with `CREATE_NO_WINDOW`,
+    so no console flashes out of the detached refresh.
+
+### Fixed
+
+- **`~`-abbreviation of the hook cwd respects path boundaries and case.**
+  `/home/brad` no longer claims `/home/bradley2`'s paths, and on Windows the
+  comparison is case-insensitive (a hook cwd of `c:\users\…` still
+  abbreviates).
+- **A non-object JSON payload on stdin (an array, a bare string) is treated as
+  absent** instead of dissolving the readout into a suppressed
+  `AttributeError`.
+
 ## [0.7.0] — 2026-07-28
 
 ### Added

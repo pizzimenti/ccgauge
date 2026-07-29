@@ -30,6 +30,10 @@ you see it without asking, and the assistant can proactively flag it.
 
 ## Install
 
+Requires Python 3.7+ (standard library only — no `pip install`, no `jq`).
+
+### Linux / macOS
+
 ```sh
 git clone https://github.com/pizzimenti/ccgauge ~/Code/ccgauge
 cd ~/Code/ccgauge
@@ -48,7 +52,47 @@ backup). Then:
    run on every render.
 3. **Restart** Claude Code (or start a new session) so the hook loads.
 
-Requires `python3` (standard library only — no `pip install`, no `jq`).
+### Windows 11
+
+```powershell
+git clone https://github.com/pizzimenti/ccgauge $env:USERPROFILE\Code\ccgauge
+cd $env:USERPROFILE\Code\ccgauge
+powershell -ExecutionPolicy Bypass -File install.ps1
+```
+
+The installer finds a working Python 3 (`python`, `py -3`, or `python3`,
+each *run* to verify it — a stock Windows `python` is the Microsoft Store
+stub), copies `usage.py` into `%USERPROFILE%\.claude` (or
+`$env:CLAUDE_CONFIG_DIR`), and registers the hook as
+
+```text
+python "C:/Users/you/.claude/usage.py" hookline
+```
+
+`hookline` is `line` plus the detached cache-warming `refresh` — everything
+`usage-line.sh` does, with no bash on the path. The forward slashes are
+deliberate: Claude Code on Windows runs hook and status-line commands through
+Git Bash when it is installed and PowerShell otherwise, and that spelling
+survives both. Then:
+
+1. **Verify:** `python "$env:USERPROFILE\.claude\usage.py" show`
+2. **Status line:** `usage.py statusline` renders a complete example status
+   line — cwd, model, context bar, usage gauges — from the JSON Claude Code
+   pipes in, one Python process per render:
+
+   ```json
+   "statusLine": { "type": "command",
+                   "command": "python \"C:/Users/you/.claude/usage.py\" statusline" }
+   ```
+
+   Already have a status line? Append a `usage.py status` call to it instead.
+3. **Restart** Claude Code (or start a new session) so the hook loads.
+
+The cache, the credentials discovery, and the history log live in
+`%USERPROFILE%\.claude` exactly as on Linux — Claude Code stores its OAuth
+token in the same `.credentials.json` there. Gauges render in Windows
+Terminal (the Win11 default) as-is; on a legacy conhost, `usage.py` switches
+on virtual-terminal processing itself.
 
 ## How it works
 
@@ -66,7 +110,8 @@ User-Agent: claude-code/<version>
 Three things make this work:
 
 - **The token** is read from `~/.claude/.credentials.json` →
-  `.claudeAiOauth.accessToken`. It's the OAuth token from your *browser* login,
+  `.claudeAiOauth.accessToken` (on Windows the same file under
+  `%USERPROFILE%\.claude`). It's the OAuth token from your *browser* login,
   which carries the `user:profile` scope this endpoint requires. (A token from
   `claude setup-token` has only `user:inference` and will be rejected.)
 - **The `anthropic-beta` header** gates the OAuth API surface.
@@ -140,7 +185,10 @@ it states none, rather than retry on a fixed clock.
   cache fresh for the next turn. The one exception: if the cache has already
   gone stale (the first prompt after an idle gap), it does a single bounded,
   self-throttled synchronous fetch first, so you see live numbers instead of a
-  last-known readout that a refresh would replace one turn later.
+  last-known readout that a refresh would replace one turn later. (On Windows
+  the registered hook is `usage.py hookline` — the same two steps, print then
+  detached warm-refresh, with the detachment done by `usage.py` itself instead
+  of a bash `&`.)
 - **Onto the status line.** `usage.py status` prints a short
   `5h [█▒▒░░░░░░░] 11%(3.7h) · 7d [▒▒▒▒░░░░░░░░░░] 3%(5.2d) · @15:38` fragment —
   a progress bar per window with the percentage beside it, colour-coded
@@ -325,7 +373,7 @@ describe a window that has already reset.
 | `mtime` as the TTL clock | No extra state file; survives restarts. |
 | Never throws | A telemetry gadget must never break a hook or status line. Worst case: it shows nothing. |
 | Synchronous fetch only when stale | Warm-cache turns stay zero-latency; only the first prompt after an idle gap pays a bounded fetch, and it shows live numbers rather than a one-turn-stale value. |
-| python3, not jq | `jq` is often missing; python3 is always present, with real JSON + datetime handling. |
+| Python, not jq | `jq` is often missing; Python is always present, with real JSON + datetime handling — and it is the one interpreter this needs on Linux, macOS and Windows alike. |
 | Secret stays in the worker | The token is read by `usage.py` and used only in the request to Anthropic's own API. The cache holds only percentages and reset times. |
 
 ## Failure modes

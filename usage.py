@@ -30,20 +30,33 @@ Modes (argv[1]):
                            does one synchronous fetch first if the cache is
                            stale (missing / idle past STALE_SECONDS), so the
                            first prompt after a break shows live numbers
+    hookline            -- `line`, then a detached background `refresh` to warm
+                           the cache for the next turn: the whole hook in one
+                           command, for platforms without usage-line.sh (the
+                           registered hook on Windows)
     status [plain]      -- short fragment (5h/7d bars) for the status line;
                            `plain` emits no ANSI at all, so the caller can colour
                            the fragment itself or measure its display width
+    statusline          -- a complete example status line (cwd, model, context
+                           bar, usage fragment) from Claude Code's status-line
+                           JSON on stdin — statusline-snippet.sh without bash
     bar <pct> [pace]    -- a standalone 0-100 progress bar (e.g. for context %),
                            with the pace shadow when a second value is given
     show                -- force a synchronous refresh, print a human block
     log [N]             -- print the last N history events (default 20)
+
+Runs on POSIX and native Windows: locking degrades from flock to msvcrt
+byte-range locks, stdio is forced to UTF-8 where the ANSI code page would eat
+the bar glyphs, and legacy consoles get virtual-terminal processing enabled.
 """
 
 import contextlib
+import errno
 import json
 import math
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -53,8 +66,12 @@ from datetime import datetime, timezone
 
 try:
     import fcntl
-except ImportError:  # non-POSIX: degrade to unlocked best-effort appends
+except ImportError:  # non-POSIX: Windows fills the role with msvcrt below
     fcntl = None
+try:
+    import msvcrt  # Windows byte-range locks stand in for flock
+except ImportError:  # neither module: degrade to unlocked best-effort I/O
+    msvcrt = None
 
 HOME = os.path.expanduser("~")
 BASE = os.environ.get("CLAUDE_CONFIG_DIR", os.path.join(HOME, ".claude"))
@@ -105,9 +122,18 @@ def user_agent():
         return _UA_CACHE
     ua = DEFAULT_UA
     with contextlib.suppress(Exception):
+        # Resolve the CLI path ourselves: on Windows an npm-installed claude is
+        # a `claude.cmd` shim, and CreateProcess's PATH search only finds
+        # `.exe`s — shutil.which honors PATHEXT and finds either. On POSIX this
+        # resolves to the same thing PATH search would. CREATE_NO_WINDOW stops
+        # the .cmd shim's cmd.exe from flashing a console when this runs from
+        # the console-less detached refresh.
+        kwargs = {}
+        if os.name == "nt":
+            kwargs["creationflags"] = 0x08000000  # CREATE_NO_WINDOW
         out = subprocess.run(
-            ["claude", "--version"],
-            capture_output=True, text=True, timeout=5, check=False,
+            [shutil.which("claude") or "claude", "--version"],
+            capture_output=True, text=True, timeout=5, check=False, **kwargs,
         ).stdout
         m = re.search(r"(\d+\.\d+\.\d+)", out)
         if m:
@@ -121,6 +147,55 @@ def user_agent():
 # --------------------------------------------------------------------------- #
 def _now():
     return time.time()
+
+
+def _init_windows_console():
+    """Windows-only, best-effort stream/console setup; a no-op elsewhere.
+
+    Closes two gaps that would otherwise void the gauge *silently* (the
+    never-raise contract turns an encoding error into empty output):
+
+    * Piped stdio defaults to the ANSI code page (cp1252 on US installs),
+      which cannot encode the bar glyphs (█ ▒ ▓ ░) or ⚠ — and hook and
+      status-line output is always piped. Claude Code decodes that output as
+      UTF-8 on every platform, so re-encode the streams to UTF-8. stdin gets
+      the same treatment for the hook payload it pipes to us.
+    * Legacy conhost prints ANSI escapes as literal text until virtual
+      terminal processing is switched on. Windows Terminal — the Win11
+      default — has it always-on and ignores this. GetConsoleMode fails when
+      stdout is a pipe, which is exactly the case where the escapes are the
+      consumer's business, so a failure means skip, not force.
+    """
+    if os.name != "nt":
+        return
+    for stream in (sys.stdout, sys.stderr, sys.stdin):
+        with contextlib.suppress(Exception):
+            if stream and (stream.encoding or "").lower().replace("-", "") != "utf8":
+                stream.reconfigure(encoding="utf-8")
+    with contextlib.suppress(Exception):
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        for handle_id in (-11, -12):  # STD_OUTPUT_HANDLE, STD_ERROR_HANDLE
+            handle = kernel32.GetStdHandle(handle_id)
+            mode = ctypes.c_uint32()
+            if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+                # 0x0004 = ENABLE_VIRTUAL_TERMINAL_PROCESSING
+                kernel32.SetConsoleMode(handle, mode.value | 0x0004)
+
+
+def _tilde(path):
+    """Abbreviate a path under HOME to ~, or return it unchanged.
+
+    Compared case-insensitively where the filesystem is (normcase), and only at
+    a path-component boundary, so on Windows a hook cwd of `c:\\users\\...`
+    still abbreviates and `/home/brad` never claims `/home/bradley2`.
+    """
+    norm = os.path.normcase
+    if norm(path).startswith(norm(HOME)):
+        rest = path[len(HOME):]
+        if not rest or rest[0] in (os.sep, os.altsep or os.sep):
+            return "~" + rest
+    return path
 
 
 def load_token():
@@ -196,15 +271,71 @@ def clear_cooldown():
         os.remove(COOLDOWN)
 
 
+def _lock_fh(fh, shared=False):
+    """Best-effort cross-process lock on an open file object; True if held.
+
+    POSIX: a blocking flock, exactly as before locking was portable. Windows:
+    msvcrt.locking on the file's first byte — it has no shared mode, so readers
+    take the exclusive lock too, and instead of msvcrt's blocking mode (which
+    polls once per second and then *raises*) contention is retried every 50 ms
+    for ~1 s, after which the caller proceeds unlocked: for a telemetry log, a
+    torn line beats a stalled prompt hook. The byte-range lock does not block
+    I/O through the *holding* handle, so the append/trim below works while the
+    lock is held, and the OS drops the lock with the handle just as flock does.
+    False (from contention, absence of both modules, or any error) means
+    "proceed unlocked" — the caller must skip the unlock.
+    """
+    if fcntl:
+        try:
+            fcntl.flock(fh, fcntl.LOCK_SH if shared else fcntl.LOCK_EX)
+            return True
+        except Exception:
+            return False
+    if msvcrt:
+        try:
+            pos = fh.tell()
+            fh.seek(0)
+            got = False
+            for _ in range(20):
+                try:
+                    msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+                    got = True
+                    break
+                except OSError:
+                    time.sleep(0.05)
+            fh.seek(pos)
+            return got
+        except Exception:
+            return False
+    return False
+
+
+def _unlock_fh(fh):
+    """Release a _lock_fh lock; never raises. Closing the file releases it on
+    both platforms anyway — the explicit release just makes the window
+    deterministic instead of waiting on the close."""
+    with contextlib.suppress(Exception):
+        if fcntl:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+        elif msvcrt:
+            pos = fh.tell()
+            fh.seek(0)
+            msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+            fh.seek(pos)
+
+
 def log_event(event, **fields):
     """Append one JSONL record to the history log. Best-effort, never raises.
 
     None-valued fields are dropped. The append and any trim run under one
-    exclusive flock on the log fd, and the trim rewrites in place (no rename),
-    so concurrent writers (foreground `line` + detached `refresh`) can neither
-    interleave mid-line nor lose an append that races a trim. The lock is held
-    for at most one ~1 MiB read+write (milliseconds). Without fcntl
-    (non-POSIX) it degrades to unlocked appends.
+    exclusive cross-process lock on the log fd (flock on POSIX, a byte-range
+    lock on Windows — see _lock_fh), and the trim rewrites in place (no
+    rename), so concurrent writers (foreground `line` + detached `refresh`)
+    can neither interleave mid-line nor lose an append that races a trim. The
+    lock matters *more* on Windows: POSIX O_APPEND writes are atomic on their
+    own, but the CRT emulates append with a seek-then-write, which isn't. The
+    lock is held for at most one ~1 MiB read+write (milliseconds). If no lock
+    can be taken, degrade to an unlocked append.
     """
     with contextlib.suppress(Exception):
         rec = {
@@ -213,23 +344,27 @@ def log_event(event, **fields):
         }
         rec.update((k, v) for k, v in fields.items() if v is not None)
         with open(LOG, "a+") as fh:
-            if fcntl:
-                fcntl.flock(fh, fcntl.LOCK_EX)  # released when fh closes
-            fh.write(json.dumps(rec) + "\n")
-            fh.flush()
-            if fh.tell() > LOG_MAX_BYTES:
-                fh.seek(0)
-                keep = fh.readlines()[-LOG_KEEP_LINES:]
-                # Bound by bytes too: oversized records (e.g. a very long cwd)
-                # could otherwise leave LOG_KEEP_LINES lines still over the
-                # cap, re-triggering this rewrite on every append. Targeting
-                # half the cap gives the same hysteresis in the normal case.
-                total = sum(len(line) for line in keep)
-                while keep and total > LOG_MAX_BYTES // 2:
-                    total -= len(keep.pop(0))
-                fh.seek(0)
-                fh.truncate()
-                fh.writelines(keep)
+            locked = _lock_fh(fh)
+            try:
+                fh.write(json.dumps(rec) + "\n")
+                fh.flush()
+                if fh.tell() > LOG_MAX_BYTES:
+                    fh.seek(0)
+                    keep = fh.readlines()[-LOG_KEEP_LINES:]
+                    # Bound by bytes too: oversized records (e.g. a very long
+                    # cwd) could otherwise leave LOG_KEEP_LINES lines still
+                    # over the cap, re-triggering this rewrite on every
+                    # append. Targeting half the cap gives the same hysteresis
+                    # in the normal case.
+                    total = sum(len(line) for line in keep)
+                    while keep and total > LOG_MAX_BYTES // 2:
+                        total -= len(keep.pop(0))
+                    fh.seek(0)
+                    fh.truncate()
+                    fh.writelines(keep)
+            finally:
+                if locked:
+                    _unlock_fh(fh)
 
 
 def _hook_payload():
@@ -242,7 +377,9 @@ def _hook_payload():
         if sys.stdin is not None and not sys.stdin.isatty():
             raw = sys.stdin.read()
             if raw.strip():
-                return json.loads(raw)
+                data = json.loads(raw)
+                if isinstance(data, dict):  # non-dict JSON is not a payload
+                    return data
     return {}
 
 
@@ -449,23 +586,40 @@ def _acquire_refresh_lock():
 
     Returns the held lock fd on success; None if another refresh already holds
     it (the caller should serve cache rather than fire a duplicate request); the
-    _NO_LOCK sentinel when fcntl is unavailable, so refresh proceeds unlocked
-    exactly as it did before locking existed.
+    _NO_LOCK sentinel when no locking primitive exists, so refresh proceeds
+    unlocked exactly as it did before locking existed.
+
+    POSIX locks with flock; Windows with msvcrt.locking on the file's first
+    byte. Both are released by the OS when the handle goes away, so a crashed
+    refresh cannot wedge future ones.
     """
-    if not fcntl:
+    if not (fcntl or msvcrt):
         return _NO_LOCK
     try:
         fd = open(LOCK, "w")
     except Exception:
         return _NO_LOCK  # can't create the lock file; don't block refresh
+    if fcntl:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            fd.close()
+            return None      # genuinely contended: another refresh is in flight
+        except OSError:
+            # filesystem doesn't support advisory locks (some NFS/FUSE homes) —
+            # proceed unlocked rather than serve cache forever
+            fd.close()
+            return _NO_LOCK
+        return fd
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
+        msvcrt.locking(fd.fileno(), msvcrt.LK_NBLCK, 1)
+    except OSError as e:
         fd.close()
-        return None      # genuinely contended: another refresh is in flight
-    except OSError:
-        # filesystem doesn't support advisory locks (some NFS/FUSE homes) —
-        # proceed unlocked rather than serve cache forever
+        # EACCES is how msvcrt spells "someone else holds the lock" (EDEADLK
+        # is its blocking-mode cousin); anything else means locking itself
+        # misbehaved, and unlocked beats never-refreshing.
+        return None if e.errno in (errno.EACCES, errno.EDEADLK) else _NO_LOCK
+    except Exception:
         fd.close()
         return _NO_LOCK
     return fd
@@ -475,7 +629,11 @@ def _release_refresh_lock(handle):
     if handle is _NO_LOCK:
         return
     with contextlib.suppress(Exception):
-        fcntl.flock(handle, fcntl.LOCK_UN)
+        if fcntl:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+        elif msvcrt:
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
     with contextlib.suppress(Exception):
         handle.close()
 
@@ -570,8 +728,8 @@ def refresh(force=False, outcome=None):
 def cmd_line():
     hook = _hook_payload()
     cwd = hook.get("cwd")
-    if isinstance(cwd, str) and cwd.startswith(HOME):
-        cwd = "~" + cwd[len(HOME):]
+    if isinstance(cwd, str):
+        cwd = _tilde(cwd)
     session = hook.get("session_id")
     c = read_cache()
     # Freshen synchronously when the readout would otherwise be stale: no cache
@@ -648,6 +806,31 @@ def cmd_line():
                 f" resume the queued work then."
             )
     print(line)
+
+
+def _spawn_detached_refresh():
+    """Kick a background `refresh` and return without waiting. Never raises.
+
+    The cross-platform equivalent of usage-line.sh's `refresh ... & disown`:
+    stdio on devnull and the child in its own session (POSIX) or its own
+    console-less process group (Windows — DETACHED_PROCESS rather than
+    CREATE_NO_WINDOW, which would still allocate a hidden console), so Claude
+    Code never waits on it and nothing flashes. The child self-throttles via
+    TTL, cooldown and the refresh lock, so firing one per prompt is cheap.
+    """
+    with contextlib.suppress(Exception):
+        kwargs = {}
+        if os.name == "nt":
+            # 0x8 DETACHED_PROCESS | 0x200 CREATE_NEW_PROCESS_GROUP (the
+            # parent console's Ctrl+C must not reach the child)
+            kwargs["creationflags"] = 0x00000008 | 0x00000200
+        else:
+            kwargs["start_new_session"] = True
+        subprocess.Popen(
+            [sys.executable, os.path.abspath(__file__), "refresh"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, close_fds=True, **kwargs,
+        )
 
 
 def _color(pct):
@@ -838,6 +1021,34 @@ def cmd_status(plain=False):
         sys.stdout.write(" " + " ".join(bits))
 
 
+def cmd_statusline():
+    """A complete status line: cwd, model, context bar, then the 5h/7d gauges.
+
+    The Python twin of statusline-snippet.sh, for platforms where bash isn't on
+    the render path — on Windows a PowerShell start-up per render would cost
+    more than the render itself, and this is one Python process instead of
+    python-inside-bash. Reads Claude Code's status-line JSON from stdin and
+    composes the same fragment the snippet does: blue cwd, dim model, a
+    pace-less context bar (a context window has no clock), then cmd_status's
+    self-contained colour fragment straight from the cache. Anything missing
+    from the payload simply doesn't render — same contract as everything else.
+    """
+    payload = _hook_payload()
+    cwd = (payload.get("workspace") or {}).get("current_dir") or payload.get("cwd") or ""
+    model = (payload.get("model") or {}).get("display_name") or ""
+    ctx = (payload.get("context_window") or {}).get("used_percentage")
+    if isinstance(cwd, str) and cwd:
+        cwd = _tilde(cwd)
+    sys.stdout.write(f"\033[0;34m{cwd}\033[0m \033[2m{model}\033[0m")
+    pct = _finite(ctx)
+    if pct is not None:
+        # _cells with 100 cells *is* the display rounding (clamped 0-100,
+        # half away from zero) — reuse it so the number and the bar agree.
+        pct = _cells(pct, 100)
+        sys.stdout.write(f" ctx {_bar(pct)} {pct}%")
+    cmd_status()
+
+
 def cmd_show():
     c = refresh(force=True)
     if not c:
@@ -912,9 +1123,12 @@ def cmd_log():
         n = 20
     try:
         with open(LOG) as fh:
-            if fcntl:
-                fcntl.flock(fh, fcntl.LOCK_SH)  # don't read mid-trim
-            lines = fh.readlines()
+            locked = _lock_fh(fh, shared=True)  # don't read mid-trim
+            try:
+                lines = fh.readlines()
+            finally:
+                if locked:
+                    _unlock_fh(fh)
     except Exception:
         lines = []
     if not lines:
@@ -937,6 +1151,7 @@ def cmd_log():
 
 def main():
     mode = sys.argv[1] if len(sys.argv) > 1 else "refresh"
+    _init_windows_console()  # internally best-effort; no-op off Windows
     # The never-raise contract, enforced at the one place every mode passes
     # through: whatever happens below, this exits 0 and disrupts nothing.
     with contextlib.suppress(Exception):
@@ -944,6 +1159,15 @@ def main():
             refresh()
         elif mode == "line":
             cmd_line()
+        elif mode == "hookline":
+            # `line` plus the detached cache-warmer, in one command — the hook
+            # entry point for platforms that can't run usage-line.sh. Order
+            # matters: line goes first so its synchronous freshen (when the
+            # cache is stale) wins the refresh lock deterministically.
+            cmd_line()
+            _spawn_detached_refresh()
+        elif mode == "statusline":
+            cmd_statusline()
         elif mode == "status":
             cmd_status(plain=(len(sys.argv) > 2 and sys.argv[2] == "plain"))
         elif mode == "bar":
