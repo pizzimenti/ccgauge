@@ -46,7 +46,7 @@ $pyToken = (@($python.exe) + $python.pre) -join ' '
 Write-Host "ccgauge: installing into $configDir (python: $pyToken)"
 New-Item -ItemType Directory -Force -Path $configDir | Out-Null
 
-Copy-Item (Join-Path $here 'usage.py') $usagePyDest -Force
+Copy-Item -LiteralPath (Join-Path $here 'usage.py') -Destination $usagePyDest -Force
 Write-Host 'ccgauge: copied usage.py'
 
 # The hook command must survive whichever shell Claude Code picks on Windows
@@ -56,50 +56,79 @@ Write-Host 'ccgauge: copied usage.py'
 $usagePyFwd = $usagePyDest -replace '\\', '/'
 $hookCmd = "$pyToken `"$usagePyFwd`" hookline"
 
-if (-not (Test-Path $settings)) {
-    Set-Content -Path $settings -Value "{`n  `"hooks`": {}`n}" -Encoding Ascii
+if (-not (Test-Path -LiteralPath $settings)) {
+    Set-Content -LiteralPath $settings -Value "{`n  `"hooks`": {}`n}" -Encoding Ascii
     Write-Host "ccgauge: created $settings"
 }
 
-Copy-Item $settings "$settings.bak" -Force
+# Validate BEFORE touching the backup: if settings.json is broken JSON, a
+# pre-existing good .bak must survive as the thing to restore from, not be
+# clobbered by a copy of the breakage. The validator swallows its own
+# exception so nothing lands on stderr — PS 5.1 under EAP=Stop turns
+# redirected stderr into a terminating error, and even unredirected
+# tracebacks are noise the throw below already covers.
+$validatePy = "import json, sys`ntry:`n    json.load(open(sys.argv[1], encoding='utf-8-sig'))`nexcept Exception:`n    sys.exit(1)"
+& $python.exe @($python.pre + @('-c', $validatePy, $settings)) | Out-Null
+if ($LASTEXITCODE -ne 0) {
+    throw "ccgauge: $settings is not valid JSON -- fix it (or delete it) and re-run. Nothing was changed."
+}
+
+Copy-Item -LiteralPath $settings "$settings.bak" -Force
 Write-Host 'ccgauge: backed up settings.json -> settings.json.bak'
 
 # Register the hook with Python, not ConvertTo-Json: PowerShell's JSON
 # round-trip re-wraps and re-types everything it touches (and 5.1 truncates
-# at -Depth), while this edits one key and leaves the rest byte-stable —
-# the same script install.sh embeds, plus in-place update of a ccgauge hook
-# registered by an earlier install (e.g. a different python token).
+# at -Depth), while this edits one key and leaves the rest untouched — the
+# same approach install.sh embeds, plus in-place update of a ccgauge hook
+# registered by an earlier install (a different python token, or the POSIX
+# usage-line.sh from a synced settings.json — replacements are printed, and
+# the write keeps LF line endings so a synced file doesn't churn to CRLF).
 $registerPy = @'
-import json, os, sys
+import json, os, re, sys
 
 path = sys.argv[1]
 hook_cmd = os.environ["CCGAUGE_HOOK_CMD"]
 
-with open(path, encoding="utf-8") as fh:
+with open(path, encoding="utf-8-sig") as fh:
     cfg = json.load(fh)
 
-hooks = cfg.setdefault("hooks", {})
-ups = hooks.setdefault("UserPromptSubmit", [])
+# A ccgauge registration and nothing else: usage-line.sh as the command's
+# last word, or usage.py with its mode as the *very next* token. An
+# unrelated hook that merely mentions usage.py somewhere, or happens to end
+# in "... line", is never claimed.
+OURS = re.compile(r"(usage-line\.sh[\"']?\s*$)|(usage\.py[\"']?\s+(hookline|line)\s*$)")
 
-def ours(cmd):
-    return ("usage-line.sh" in cmd
-            or ("usage.py" in cmd and ("hookline" in cmd or " line" in cmd)))
+hooks = cfg.get("hooks")
+if hooks is None:
+    hooks = cfg["hooks"] = {}
+if not isinstance(hooks, dict):
+    print("ccgauge: settings.json 'hooks' is not an object -- not touching it")
+    sys.exit(1)
+ups = hooks.get("UserPromptSubmit")
+if ups is None:
+    ups = hooks["UserPromptSubmit"] = []
+if not isinstance(ups, list):
+    print("ccgauge: settings.json hooks.UserPromptSubmit is not a list -- not touching it")
+    sys.exit(1)
 
-existing = [h for g in ups for h in g.get("hooks", [])
-            if ours(h.get("command", ""))]
+existing = [h for g in ups if isinstance(g, dict)
+            for h in (g.get("hooks") or [])
+            if isinstance(h, dict) and OURS.search(str(h.get("command", "")))]
 
 def write():
-    with open(path, "w", encoding="utf-8") as fh:
+    with open(path, "w", encoding="utf-8", newline="\n") as fh:
         json.dump(cfg, fh, indent=2)
         fh.write("\n")
 
-if any(h.get("command") == hook_cmd for h in existing):
+stale = [h for h in existing if h.get("command") != hook_cmd]
+if existing and not stale:
     print("ccgauge: hook already registered -- leaving settings.json unchanged")
-elif existing:
-    for h in existing:
+elif stale:
+    for h in stale:
+        print("ccgauge: replacing ccgauge hook: " + str(h.get("command", "")))
         h["command"] = hook_cmd
     write()
-    print("ccgauge: updated the existing ccgauge hook in settings.json")
+    print("ccgauge: ccgauge hook is now: " + hook_cmd)
 else:
     ups.append({"hooks": [{"type": "command", "command": hook_cmd}]})
     write()
@@ -108,12 +137,12 @@ else:
 
 $env:CCGAUGE_HOOK_CMD = $hookCmd
 $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("ccgauge-register-" + [System.IO.Path]::GetRandomFileName() + ".py")
-Set-Content -Path $tmp -Value $registerPy -Encoding UTF8
+Set-Content -LiteralPath $tmp -Value $registerPy -Encoding UTF8
 try {
     & $python.exe @($python.pre + @($tmp, $settings))
-    if ($LASTEXITCODE -ne 0) { throw "ccgauge: failed to update $settings (restore from settings.json.bak)" }
+    if ($LASTEXITCODE -ne 0) { throw "ccgauge: could not update $settings -- it was not modified (details above)" }
 } finally {
-    Remove-Item $tmp -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $tmp -ErrorAction SilentlyContinue
     Remove-Item Env:CCGAUGE_HOOK_CMD -ErrorAction SilentlyContinue
 }
 

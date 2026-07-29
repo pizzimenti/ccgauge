@@ -60,9 +60,11 @@ import shutil
 import subprocess
 import sys
 import time
-import urllib.request
-import urllib.error
 from datetime import datetime, timezone
+
+# urllib is imported lazily in _http_get: it drags in the whole http/email
+# stack (~80-110 ms on Windows), which is half the start-up of the read-only
+# modes — and `status`/`statusline` run on every status-line repaint.
 
 try:
     import fcntl
@@ -128,16 +130,44 @@ def user_agent():
         # resolves to the same thing PATH search would. CREATE_NO_WINDOW stops
         # the .cmd shim's cmd.exe from flashing a console when this runs from
         # the console-less detached refresh.
+        exe = shutil.which("claude")
         kwargs = {}
         if os.name == "nt":
             kwargs["creationflags"] = 0x08000000  # CREATE_NO_WINDOW
-        out = subprocess.run(
-            [shutil.which("claude") or "claude", "--version"],
-            capture_output=True, text=True, timeout=5, check=False, **kwargs,
-        ).stdout
-        m = re.search(r"(\d+\.\d+\.\d+)", out)
-        if m:
-            ua = "claude-code/" + m.group(1)
+            # Refuse a `claude` resolved from the *current directory*: hooks
+            # run with cwd inside the user's project — untrusted content — and
+            # shutil.which on Windows before 3.12 unconditionally searches cwd
+            # first (3.12+ only when the machine config asks for it). A repo
+            # cannot be allowed to plant a claude.cmd that a hook then runs.
+            # No probe (and the pinned UA) beats running it.
+            if exe and (os.path.normcase(os.path.dirname(os.path.abspath(exe)))
+                        == os.path.normcase(os.getcwd())):
+                exe = None
+        else:
+            exe = exe or "claude"
+        if exe:
+            # Not subprocess.run(timeout=...): on Windows its TimeoutExpired
+            # path kills the direct child (the .cmd shim's cmd.exe) and then
+            # re-reads the pipes with NO timeout — and the shim's node
+            # grandchild, still holding the inherited write handles, blocks
+            # that read until it exits on its own. A hook that "times out in
+            # 5s" hanging for a minute is exactly that. Kill and *abandon*
+            # instead: the pipe-reader threads are daemonic, so nothing keeps
+            # the process alive, and the fallback UA covers the gap.
+            proc = subprocess.Popen(
+                [exe, "--version"], stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                text=True, **kwargs,
+            )
+            try:
+                out, _ = proc.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                with contextlib.suppress(Exception):
+                    proc.kill()
+                out = ""
+            m = re.search(r"(\d+\.\d+\.\d+)", out)
+            if m:
+                ua = "claude-code/" + m.group(1)
     _UA_CACHE = ua
     return ua
 
@@ -171,7 +201,14 @@ def _init_windows_console():
     for stream in (sys.stdout, sys.stderr, sys.stdin):
         with contextlib.suppress(Exception):
             if stream and (stream.encoding or "").lower().replace("-", "") != "utf8":
-                stream.reconfigure(encoding="utf-8")
+                try:
+                    stream.reconfigure(encoding="utf-8")
+                except Exception:
+                    # Can't change the encoding (exotic replaced stream):
+                    # settle for lossy output — ? for █ is a readable gauge,
+                    # an UnicodeEncodeError eaten by the never-raise umbrella
+                    # is a blank one.
+                    stream.reconfigure(errors="replace")
     with contextlib.suppress(Exception):
         import ctypes
         kernel32 = ctypes.windll.kernel32
@@ -189,23 +226,41 @@ def _tilde(path):
     Compared case-insensitively where the filesystem is (normcase), and only at
     a path-component boundary, so on Windows a hook cwd of `c:\\users\\...`
     still abbreviates and `/home/brad` never claims `/home/bradley2`.
+
+    A trailing separator on HOME (a hand-set USERPROFILE often has one) is
+    ignored for the comparison; a HOME that *is* a filesystem root is not
+    abbreviated at all — `~` in front of everything on the drive is noise,
+    not a shorthand.
     """
     norm = os.path.normcase
-    if norm(path).startswith(norm(HOME)):
-        rest = path[len(HOME):]
+    home = HOME.rstrip("/\\")
+    if not home or home.endswith(":"):
+        return path
+    if norm(path).startswith(norm(home)):
+        rest = path[len(home):]
         if not rest or rest[0] in (os.sep, os.altsep or os.sep):
             return "~" + rest
     return path
 
 
 def load_token():
-    """Return (access_token, expires_at_seconds) or (None, None)."""
+    """Return (access_token, expires_at_seconds) or (None, None).
+
+    Read as UTF-8 (with an optional BOM): the file is written by Claude Code
+    — JSON on disk is UTF-8 — and Windows' locale default (cp1252) would both
+    misread any non-ASCII byte and reject a hand-editor's BOM. Non-dict JSON
+    anywhere in the shape degrades to "no token" like every other defect here.
+    """
     try:
-        with open(CRED) as fh:
+        with open(CRED, encoding="utf-8-sig") as fh:
             data = json.load(fh)
     except Exception:
         return None, None
+    if not isinstance(data, dict):
+        return None, None
     oauth = data.get("claudeAiOauth", data)  # tolerate either nesting
+    if not isinstance(oauth, dict):
+        return None, None
     token = oauth.get("accessToken")
     exp = oauth.get("expiresAt")  # milliseconds in Claude Code's format
     exp_s = (exp / 1000.0) if isinstance(exp, (int, float)) else None
@@ -427,6 +482,8 @@ def _retry_after_seconds(err):
 
 def _http_get(token):
     """Return (status_code_or_None, body_dict_or_None, retry_after_seconds_or_None)."""
+    import urllib.error
+    import urllib.request
     req = urllib.request.Request(
         URL,
         headers={
@@ -745,7 +802,8 @@ def cmd_line():
     # its real cause rather than re-deriving it afterward (which mislabels lock
     # contention and races token/cooldown state).
     reason = None
-    prev_age = (_now() - c.get("fetched_at", 0)) if c else None
+    prev_fa = c.get("fetched_at") if c else None
+    prev_age = (_now() - prev_fa) if isinstance(prev_fa, (int, float)) else None
     if prev_age is None or prev_age > STALE_SECONDS:
         outcome = {}
         fresh = refresh(outcome=outcome)
@@ -763,10 +821,14 @@ def cmd_line():
         return
     r5 = fmt_reset(c.get("five_hour_reset"))
     r7 = fmt_reset(c.get("seven_day_reset"))
-    age = int(_now() - c.get("fetched_at", _now()))
+    # A non-numeric fetched_at (a hand-damaged cache) counts as stale-with-
+    # unknown-age rather than raising: the percentages beside it may still be
+    # real, and one bad field must not void the whole line.
+    fa = c.get("fetched_at")
+    age = int(_now() - fa) if isinstance(fa, (int, float)) else None
     log_event("prompt", five_hour_pct=p5, seven_day_pct=p7, cache_age_s=age,
               cwd=cwd, session_id=session)
-    stale = age > STALE_SECONDS
+    stale = age is None or age > STALE_SECONDS
     parts = []
     if p5 is not None:
         parts.append(f"session(5h) last-known {p5}% (NOT live)" if stale
@@ -785,7 +847,8 @@ def cmd_line():
         why = _stale_why(reason)
         clk = fmt_clock(c.get("fetched_at"))
         since = f" (last good {clk})" if clk else ""
-        line += (f"  ⚠ STALE {age // 60}m{since} — {why}."
+        for_txt = f"{age // 60}m" if age is not None else "(age unknown)"
+        line += (f"  ⚠ STALE {for_txt}{since} — {why}."
                  f" The values above are the last successful read, NOT current;"
                  f" do not trust them. Run `/usage` in-app for live numbers.")
     else:
@@ -1034,13 +1097,22 @@ def cmd_statusline():
     from the payload simply doesn't render — same contract as everything else.
     """
     payload = _hook_payload()
-    cwd = (payload.get("workspace") or {}).get("current_dir") or payload.get("cwd") or ""
-    model = (payload.get("model") or {}).get("display_name") or ""
-    ctx = (payload.get("context_window") or {}).get("used_percentage")
-    if isinstance(cwd, str) and cwd:
-        cwd = _tilde(cwd)
+
+    # Every extraction is type-checked, not just null-checked: the docstring's
+    # "anything missing simply doesn't render" has to hold for *malformed* too.
+    # One wrong-typed field raising here would blank the whole line — including
+    # the usage gauges, which don't depend on the payload at all.
+    def sub(key, inner):
+        d = payload.get(key)
+        v = d.get(inner) if isinstance(d, dict) else None
+        return v
+
+    cwd = sub("workspace", "current_dir") or payload.get("cwd")
+    cwd = _tilde(cwd) if isinstance(cwd, str) else ""
+    model = sub("model", "display_name")
+    model = model if isinstance(model, str) else ""
     sys.stdout.write(f"\033[0;34m{cwd}\033[0m \033[2m{model}\033[0m")
-    pct = _finite(ctx)
+    pct = _finite(sub("context_window", "used_percentage"))
     if pct is not None:
         # _cells with 100 cells *is* the display rounding (clamped 0-100,
         # half away from zero) — reuse it so the number and the bar agree.
@@ -1129,8 +1201,14 @@ def cmd_log():
             finally:
                 if locked:
                     _unlock_fh(fh)
-    except Exception:
+    except FileNotFoundError:
         lines = []
+    except Exception:
+        # Windows byte-range locks are mandatory: losing the lock race and
+        # reading anyway raises. "No events recorded yet" would be a lie —
+        # the log is full, just briefly unreadable.
+        print("usage log: unreadable right now (another process holds it) — try again")
+        return
     if not lines:
         print("usage log: no events recorded yet")
         return
@@ -1163,8 +1241,12 @@ def main():
             # `line` plus the detached cache-warmer, in one command — the hook
             # entry point for platforms that can't run usage-line.sh. Order
             # matters: line goes first so its synchronous freshen (when the
-            # cache is stale) wins the refresh lock deterministically.
-            cmd_line()
+            # cache is stale) wins the refresh lock deterministically. Its own
+            # suppress keeps the two as independent as the shell wrapper's two
+            # processes: a raise inside cmd_line must not also kill the
+            # warm-refresh, or one bad cache value silences the gauge forever.
+            with contextlib.suppress(Exception):
+                cmd_line()
             _spawn_detached_refresh()
         elif mode == "statusline":
             cmd_statusline()
