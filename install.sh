@@ -98,6 +98,23 @@ if [ "$CHECK_ONLY" -eq 0 ]; then
   echo "ccgauge: installing into $CONFIG_DIR"
   mkdir -p "$CONFIG_DIR/hooks"
 
+  # $CONFIG_DIR/statusline.sh is not a name ccgauge owns — Claude Code's own
+  # /statusline command writes there too. Overwriting someone's script with no
+  # copy anywhere is the same data loss the settings.json backups exist to
+  # prevent, so back it up unless it is already ours.
+  if [ -f "$STATUSLINE_DST" ] && ! cmp -s "$HERE/statusline.sh" "$STATUSLINE_DST"; then
+    if ! head -3 "$STATUSLINE_DST" 2>/dev/null | grep -q "ccgauge's status line"; then
+      sl_backup="$STATUSLINE_DST.$(date +%Y%m%d-%H%M%S).bak"
+      n=1
+      while [ -e "$sl_backup" ]; do
+        n=$((n + 1)); sl_backup="$STATUSLINE_DST.$(date +%Y%m%d-%H%M%S)-$n.bak"
+      done
+      cp -p "$STATUSLINE_DST" "$sl_backup"
+      warn "an existing statusline.sh was already here — backed it up to"
+      warn "  $(basename "$sl_backup")"
+    fi
+  fi
+
   cp "$HERE/usage.py"           "$USAGE_DST"
   cp "$HERE/hooks/usage-line.sh" "$HOOK_DST"
   cp "$HERE/statusline.sh"      "$STATUSLINE_DST"
@@ -123,7 +140,11 @@ if [ "$CHECK_ONLY" -eq 0 ]; then
 import datetime, json, os, shlex, shutil, sys
 
 G, Y, R, X = "\033[0;32m", "\033[0;33m", "\033[0;31m", "\033[0m"
-path = sys.argv[1]
+# Resolve first. The atomic write replaces a *directory entry*, so a symlinked
+# settings.json — one pointed at a dotfiles repo, say — would be severed and
+# replaced by a regular file, with the edits landing there and the real target
+# never updated at all. Writing to the resolved target keeps the link intact.
+path = os.path.realpath(sys.argv[1])
 
 # Both values are *shell command strings*, so both get quoted. Quoting only the
 # status line (as an earlier revision did) leaves a config dir containing a
@@ -174,12 +195,22 @@ existing = [h for g in groups if isinstance(g, dict)
             and refers_to(h.get("command"), hook_path)]
 if len(existing) > 1:
     print(f"  {Y}warn{X}  {len(existing)} duplicate hook registrations found — pruning to one")
+    kept = []
     for g in groups:
-        if isinstance(g, dict):
-            g["hooks"] = [h for h in g.get("hooks", [])
-                          if not (isinstance(h, dict)
-                                  and refers_to(h.get("command"), hook_path))]
-    groups[:] = [g for g in groups if isinstance(g, dict) and g.get("hooks")]
+        if not isinstance(g, dict):
+            kept.append(g)          # not ours to interpret; leave it exactly as-is
+            continue
+        before = g.get("hooks", [])
+        after = [h for h in before
+                 if not (isinstance(h, dict)
+                         and refers_to(h.get("command"), hook_path))]
+        # Drop a group only if *we* emptied it. A group the user left empty — a
+        # matcher-scoped placeholder, say — is theirs, and a blanket
+        # "delete every group with no hooks" silently deletes it.
+        if after or not before:
+            g["hooks"] = after
+            kept.append(g)
+    groups[:] = kept
     existing = []
 if existing:
     print(f"  {G}ok{X}    UserPromptSubmit hook already registered")
@@ -465,13 +496,27 @@ if [ -z "$sl_cmd_stored" ]; then
   # Judging theirs by whether it draws ccgauge's glyphs would fail a setup the
   # README explicitly supports.
   ok "status line is not ccgauge's — not exercised"
-elif sl_out=$(printf '%s' "$SAMPLE" | env -u CCGAUGE_USAGE_PY sh -c "$sl_cmd_stored" 2>"$sl_err") \
-     && printf '%s' "$sl_out" | grep -q '[█░]'; then
-  ok "status line renders a gauge"
-  printf '        %s\n' "$(printf '%b' "$sl_out" | tail -1)"
-else
-  fail "status line did not render a gauge — run: echo '{}' | sh -c $sl_cmd_stored"
+elif ! sl_out=$(printf '%s' "$SAMPLE" | env -u CCGAUGE_USAGE_PY sh -c "$sl_cmd_stored" 2>"$sl_err"); then
+  fail "status line failed to run — try: echo '{}' | sh -c $sl_cmd_stored"
   [ -s "$sl_err" ] && printf '        %s\n' "$(head -2 "$sl_err")"
+# Assert on ccgauge's OWN fragment, not merely on a bar glyph. The sample payload
+# carries a context-window percentage, so statusline.sh draws a `ctx` bar from it
+# with no cache involved — a bare `grep '[█░]'` is satisfied by that alone and
+# passes while the 5h/7d gauges render nothing whatsoever.
+#
+# Matched against escape-stripped output: the gauges are colourised, so `5h` and
+# its bracket are separated by an SGR sequence in the raw text and a literal
+# "5h [" never matches — which would fail a perfectly good install.
+elif printf '%s' "$sl_out" | sed 's/\x1b\[[0-9;]*m//g' | grep -qE '(5h|7d) \['; then
+  ok "status line renders the usage gauges"
+  printf '        %s\n' "$(printf '%b' "$sl_out" | tail -1)"
+elif [ ! -f "$CONFIG_DIR/usage-cache.json" ]; then
+  # No cache yet means the gauges are *correctly* absent, not broken.
+  warn "status line runs, but there is no usage cache yet to render"
+  warn "re-check after a turn or two with: ./install.sh --check"
+else
+  fail "status line ran but drew no 5h/7d gauge despite a cache being present"
+  printf '        %s\n' "$(printf '%b' "$sl_out" | tail -1)"
 fi
 
 # Credentials and the endpoint are best-effort: no network in a container, or a

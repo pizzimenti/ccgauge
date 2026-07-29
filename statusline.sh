@@ -28,8 +28,18 @@ except Exception:
     d = {}
 cwd = (d.get("workspace") or {}).get("current_dir") or d.get("cwd") or ""
 model = (d.get("model") or {}).get("display_name") or ""
+# Round to a whole percent here rather than in the shell. bash printf parses
+# floats through the *ambient* locale, and prefixing LC_NUMERIC=C does not
+# reach the builtin — in any comma-decimal locale (de_DE, fr_FR, ...) it stops
+# at the "." and returns non-zero, so a shell-side conversion is either wrong
+# or, if you trust the exit status, silently drops the whole indicator. Python
+# is already a hard dependency and is locale-independent here.
 ctx = (d.get("context_window") or {}).get("used_percentage")
-sys.stdout.write("\x1f".join([cwd, model, "" if ctx is None else str(ctx)]))
+try:
+    ctx = str(max(0, min(100, round(float(ctx)))))
+except (TypeError, ValueError):
+    ctx = ""
+sys.stdout.write("\x1f".join([cwd, model, ctx]))
 ' 2>/dev/null)
 IFS=$'\x1f' read -r cwd model used_pct <<< "$parsed"
 
@@ -51,20 +61,13 @@ fi
 # context window has no clock, so there is no "on track" position for it.
 ctx_str=""
 if [ -n "$used_pct" ]; then
-  # LC_NUMERIC=C so printf parses the JSON float (dot decimal) regardless of
-  # locale — a comma-decimal locale would otherwise error on "11.5".
-  #
-  # The result is validated rather than trusted: bash's printf writes "0" to
-  # stdout *before* returning non-zero on a bad conversion, so a `|| echo ""`
-  # fallback never fires and an unparseable percentage would render as a
-  # confident, fabricated `ctx 0%`. Better to show no indicator than a wrong one.
-  if used_int=$(LC_NUMERIC=C printf "%.0f" "$used_pct" 2>/dev/null); then
-    case "$used_int" in
-      ''|*[!0-9]*) used_int="" ;;   # negative, or something unexpected
-    esac
-  else
-    used_int=""                      # conversion failed; "0" on stdout is a lie
-  fi
+  # Already a clamped whole number from the parser above, but re-validate: this
+  # value reaches an arithmetic comparison, and showing no indicator is always
+  # better than showing a wrong one.
+  used_int="$used_pct"
+  case "$used_int" in
+    ''|*[!0-9]*) used_int="" ;;
+  esac
   if [ -n "$used_int" ]; then
     # Omit the whole segment if the bar can't be produced, rather than rendering
     # a bar-less `ctx  31%` — a missing usage.py should read as "not installed",
