@@ -4,7 +4,11 @@ All notable changes to ccgauge are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); this project uses
 [Semantic Versioning](https://semver.org/).
 
-## [0.8.0] — 2026-07-28
+## [0.9.0] — 2026-07-30
+
+Makes `./install.sh` a complete install on POSIX rather than half of one, and
+gives it a verification pass that fails loudly. The Windows path added in 0.8.0
+is unaffected — `install.ps1` remains the installer there.
 
 ### Changed
 
@@ -67,6 +71,127 @@ All notable changes to ccgauge are documented here. Format follows
   example that existed only because the installer would not configure a status
   line itself; shipping both a real one and an example invited exactly the
   confusion of not knowing which one was live.
+
+## [0.8.1] — 2026-07-29
+
+Fixes from an adversarial three-lens review of 0.8.0 (Windows/CRT semantics,
+the never-raise/never-hang contract, PowerShell on both engines), every
+mechanism re-verified empirically on Windows 11.
+
+### Fixed
+
+- **The `claude --version` probe can no longer hang a prompt past its
+  timeout.** `subprocess.run(timeout=5)` is not a hard bound on Windows: on
+  timeout it kills the direct child — for an npm install that's the
+  `claude.cmd` shim's `cmd.exe` — then re-reads the pipes with *no* timeout,
+  and the shim's `node` grandchild, still holding the inherited write
+  handles, blocks that read until it exits (reproduced: a stalling shim held
+  a "5s" probe for 8s; an AV-wedged one could hold a prompt for a minute).
+  The probe now uses `Popen` + `communicate(timeout=5)` and on expiry kills
+  and *abandons* — the reader threads are daemonic — falling back to the
+  pinned UA.
+- **A `claude` binary planted in the project directory is never executed.**
+  Hooks run with cwd inside the user's project, and `shutil.which` on
+  Windows searches the cwd first on Python < 3.12 (and on 3.12+ where the
+  machine config asks for it). A cwd-resolved `claude` is now rejected and
+  the probe skipped — the pinned UA beats running untrusted content.
+- **One bad cache value can no longer silence the gauge permanently.**
+  `hookline` ran `line` and the detached cache-warmer under one exception
+  umbrella, so a raise inside `line` (e.g. a cache with a non-numeric
+  `fetched_at`, which also crashed the pre-refresh age check — both fixed)
+  skipped the warm-refresh too; since `line` raised before ever fetching,
+  nothing would ever repair the cache. The two now fail independently,
+  matching the two-process POSIX wrapper.
+- **`statusline` renders the gauges even when the payload is malformed.**
+  A wrong-*typed* field (`"workspace"` as a string, `"context_window"` as a
+  list) blanked the entire status line, gauges included, though they need
+  nothing from the payload. Every extraction is now type-checked; a bad
+  field just doesn't render, as the contract says.
+- **`usage.py log` no longer claims "no events recorded yet" when it merely
+  lost the lock race** (Windows byte-range locks are mandatory, so an
+  unlocked read of a locked log raises). It now says the log is briefly
+  unreadable and to retry — and only reports "no events" for a genuinely
+  absent log.
+- **`.credentials.json` is read as UTF-8 (BOM tolerated)** instead of the
+  locale code page, and non-dict JSON in it degrades to "no token" instead
+  of an (absorbed) crash. `~`-abbreviation now also survives a trailing
+  separator on a hand-set `USERPROFILE`/`HOME`, and declines to abbreviate
+  a drive-root HOME. If a stream's UTF-8 reconfigure itself fails, output
+  degrades to `?`-for-glyph rather than an invisible encoding error.
+- **`install.ps1`: the hook matcher is precise, migrations are loud, and
+  bad states fail before the backup is touched.** The old matcher claimed
+  any command containing `usage.py` plus ` line` anywhere (reproduced
+  destroying an unrelated hook); it now requires the mode as the token
+  immediately after `usage.py` (or a trailing `usage-line.sh`). Every
+  replaced command is printed. settings.json is validated *before* the
+  `.bak` is overwritten, so broken JSON can't clobber a good backup (and
+  the error says so, without a traceback). A BOM'd settings.json is read
+  correctly (`utf-8-sig`); writes keep LF line endings so a dotfiles-synced
+  file doesn't churn to CRLF; a stale ccgauge sibling next to an exact match
+  is now also rewritten instead of left to double-inject the `[usage]`
+  line; `-LiteralPath` throughout for bracket-safe paths; non-object
+  `hooks`/`UserPromptSubmit` shapes are refused cleanly.
+
+### Changed
+
+- **`urllib` is imported only when a fetch actually happens.** It drags in
+  the whole `http`/`email` stack — ~80–110 ms, half the start-up of the
+  read-only modes on Windows — and `status`/`statusline` run on every
+  status-line repaint.
+
+## [0.8.0] — 2026-07-29
+
+### Added
+
+- **Native Windows 11 support.** The same `usage.py`, the same cache files, the
+  same `%USERPROFILE%\.claude\.credentials.json` token Claude Code already
+  writes on Windows — no WSL, no bash. What it took:
+  - **`usage.py hookline`** — the hook in one command: `line`, then a detached
+    background `refresh` spawned by `usage.py` itself (`DETACHED_PROCESS` on
+    Windows, its own session on POSIX), replacing `usage-line.sh`'s `&`/`disown`
+    on platforms that don't have it. This is what the Windows installer
+    registers.
+  - **`usage.py statusline`** — a complete example status line (cwd, model,
+    context bar, usage gauges) rendered from the status-line JSON on stdin.
+    One Python process per render; no bash, and none of the ~200 ms a
+    PowerShell start-up would cost on every repaint. Works on POSIX too.
+  - **`install.ps1`** — the installer as a PowerShell twin of `install.sh`
+    (Windows PowerShell 5.1 and pwsh 7+): finds a *working* Python 3 (`python`
+    / `py -3` / `python3`, each actually run, because a stock Windows `python`
+    is the Microsoft Store stub), copies `usage.py`, and registers the hook
+    idempotently with the same `.bak` backup. The generated command uses
+    forward slashes and plain double quotes so it parses identically under
+    Git Bash and PowerShell — whichever Claude Code picks.
+  - **Real locking on Windows.** The refresh lock and the history-log lock,
+    previously `fcntl`-only (Windows silently ran unlocked), now fall back to
+    `msvcrt` byte-range locks with the same semantics: non-blocking contention
+    for the refresh lock, OS-released on process death, and a bounded ~1 s
+    retry for the log (past which it degrades to an unlocked append rather
+    than stall a prompt). The log lock matters *more* on Windows: POSIX
+    `O_APPEND` writes are atomic on their own; the CRT's append emulation is
+    a seek-then-write, which isn't.
+  - **UTF-8 stdio + ANSI on legacy consoles.** Piped stdout on Windows
+    defaults to the ANSI code page (cp1252), which cannot encode `█ ▒ ▓ ░ ⚠`
+    — and under the never-raise contract that error would surface as a
+    silently blank gauge. `usage.py` now re-encodes piped stdio to UTF-8
+    (what Claude Code decodes on every platform) and enables
+    virtual-terminal processing on legacy conhost, where Windows Terminal
+    needs nothing.
+  - **`claude --version` found through its npm shim.** `claude` on Windows is
+    typically a `claude.cmd` shim, which a bare `CreateProcess` PATH search
+    never finds; the User-Agent probe now resolves the CLI with
+    `shutil.which` (honours `PATHEXT`) and runs it with `CREATE_NO_WINDOW`,
+    so no console flashes out of the detached refresh.
+
+### Fixed
+
+- **`~`-abbreviation of the hook cwd respects path boundaries and case.**
+  `/home/brad` no longer claims `/home/bradley2`'s paths, and on Windows the
+  comparison is case-insensitive (a hook cwd of `c:\users\…` still
+  abbreviates).
+- **A non-object JSON payload on stdin (an array, a bare string) is treated as
+  absent** instead of dissolving the readout into a suppressed
+  `AttributeError`.
 
 ## [0.7.0] — 2026-07-28
 

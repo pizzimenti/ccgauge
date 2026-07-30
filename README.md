@@ -30,6 +30,18 @@ you see it without asking, and the assistant can proactively flag it.
 
 ## Install
 
+Requires Python 3.7+ (standard library only — no `pip install`, no `jq`).
+
+### Platform support
+
+| | |
+| :-- | :-- |
+| **Linux** | Supported and developed on. Use `install.sh`. |
+| **Windows 11** | Supported natively. Use `install.ps1` — see below. |
+| **macOS** | **Not supported.** Claude Code stores its OAuth token in the macOS Keychain rather than in `~/.claude/.credentials.json` ([docs](https://code.claude.com/docs/en/authentication)), so there is no file for ccgauge to read and no amount of logging in will create one. Reading the Keychain isn't implemented, so `install.sh` refuses to run there rather than leaving a gauge that can never populate. |
+
+### Linux
+
 ```sh
 git clone https://github.com/pizzimenti/ccgauge ~/Code/ccgauge
 cd ~/Code/ccgauge
@@ -37,21 +49,9 @@ cd ~/Code/ccgauge
 ```
 
 That's the whole install. Restart Claude Code (or start a new session) and both
-halves are live. Requires `python3` — standard library only, no `pip install`,
-no `jq`.
+halves are live.
 
-### Platform support
-
-| | |
-| :-- | :-- |
-| **Linux** | Supported and developed on. |
-| **Windows** | Should work, but **needs [Git for Windows](https://git-scm.com/downloads/win)** — Claude Code runs hooks and the status line through Git Bash when it's installed and PowerShell when it isn't, and these are bash scripts. Untested; reports welcome. |
-| **macOS** | **Not supported.** Claude Code stores its OAuth token in the macOS Keychain rather than in `~/.claude/.credentials.json` ([docs](https://code.claude.com/docs/en/authentication)), so there is no file for ccgauge to read and no amount of logging in will create one. Reading the Keychain isn't implemented. |
-
-The installer detects all three and says so up front rather than letting you
-discover it as a permanently blank gauge — on macOS it fails outright.
-
-### What it installs
+#### What it installs
 
 The installer copies three files into your Claude config dir (`~/.claude`, or
 `$CLAUDE_CONFIG_DIR`) and registers both of them in `settings.json`,
@@ -88,7 +88,7 @@ forced refresh, and executing the hook — which detaches a background refresh o
 its own), and reports cache age instead. Firing a request to diagnose a lockout
 is how you extend one.
 
-### If you already have a status line
+#### If you already have a status line
 
 **The installer leaves it alone.** It tells you what it found and stops there,
 because replacing it by default would mean the documented "keep your own" setup
@@ -106,10 +106,64 @@ every render. Use `status plain` instead if you want to colour the fragment
 yourself; it emits no ANSI at all. Either way,
 [`statusline.sh`](./statusline.sh) is a working reference.
 
+There are two complete status lines in the repo, for two different reasons.
+`statusline.sh` is the POSIX one this installer wires up: a shell script, so it
+can pick up the git branch without a second process. `usage.py statusline` is
+the Windows one, rendering the same information in a single Python process
+because Windows has no bash to rely on. Use whichever matches your platform;
+`install.sh` and `install.ps1` each pick the right one for you.
+
 Or hand yours over with `./install.sh --statusline`, which backs up the previous
 `settings.json` to a timestamped file first. Backups are only written on a run
 that actually changes something, so nothing ever overwrites an earlier one and a
 repeat run leaves no litter — you can always get back to what you had.
+
+### Windows 11
+
+```powershell
+git clone https://github.com/pizzimenti/ccgauge $env:USERPROFILE\Code\ccgauge
+cd $env:USERPROFILE\Code\ccgauge
+powershell -ExecutionPolicy Bypass -File install.ps1
+```
+
+The installer finds a working Python 3 (`python`, `py -3`, or `python3`,
+each *run* to verify it — a stock Windows `python` is the Microsoft Store
+stub), copies `usage.py` into `%USERPROFILE%\.claude` (or
+`$env:CLAUDE_CONFIG_DIR`), and registers the hook as
+
+```text
+python "C:/Users/you/.claude/usage.py" hookline
+```
+
+`hookline` is `line` plus the detached cache-warming `refresh` — everything
+`usage-line.sh` does, with no bash on the path. The forward slashes are
+deliberate: Claude Code on Windows runs hook and status-line commands through
+Git Bash when it is installed and PowerShell otherwise, and that spelling
+survives both. Re-running the installer is safe: an existing ccgauge
+registration — including a POSIX `usage-line.sh` one from a synced
+settings.json — is rewritten in place (and each replacement is printed)
+rather than accumulating duplicates. Then:
+
+1. **Verify:** `python "$env:USERPROFILE\.claude\usage.py" show` — substitute
+   the interpreter the installer said it picked (`py -3` on machines where
+   `python` is only the Store stub); its final output shows the exact command.
+2. **Status line:** `usage.py statusline` renders a complete example status
+   line — cwd, model, context bar, usage gauges — from the JSON Claude Code
+   pipes in, one Python process per render:
+
+   ```json
+   "statusLine": { "type": "command",
+                   "command": "python \"C:/Users/you/.claude/usage.py\" statusline" }
+   ```
+
+   Already have a status line? Append a `usage.py status` call to it instead.
+3. **Restart** Claude Code (or start a new session) so the hook loads.
+
+The cache, the credentials discovery, and the history log live in
+`%USERPROFILE%\.claude` exactly as on Linux — Claude Code stores its OAuth
+token in the same `.credentials.json` there. Gauges render in Windows
+Terminal (the Win11 default) as-is; on a legacy conhost, `usage.py` switches
+on virtual-terminal processing itself.
 
 ## How it works
 
@@ -127,7 +181,8 @@ User-Agent: claude-code/<version>
 Three things make this work:
 
 - **The token** is read from `~/.claude/.credentials.json` →
-  `.claudeAiOauth.accessToken`. It's the OAuth token from your *browser* login,
+  `.claudeAiOauth.accessToken` (on Windows the same file under
+  `%USERPROFILE%\.claude`). It's the OAuth token from your *browser* login,
   which carries the `user:profile` scope this endpoint requires. (A token from
   `claude setup-token` has only `user:inference` and will be rejected.)
 - **The `anthropic-beta` header** gates the OAuth API surface.
@@ -201,7 +256,10 @@ it states none, rather than retry on a fixed clock.
   cache fresh for the next turn. The one exception: if the cache has already
   gone stale (the first prompt after an idle gap), it does a single bounded,
   self-throttled synchronous fetch first, so you see live numbers instead of a
-  last-known readout that a refresh would replace one turn later.
+  last-known readout that a refresh would replace one turn later. (On Windows
+  the registered hook is `usage.py hookline` — the same two steps, print then
+  detached warm-refresh, with the detachment done by `usage.py` itself instead
+  of a bash `&`.)
 - **Onto the status line.** `usage.py status` prints a short
   `5h [█▒▒░░░░░░░] 11%(3.7h) · 7d [▒▒▒▒░░░░░░░░░░] 3%(5.2d) · @15:38` fragment —
   a progress bar per window with the percentage beside it, colour-coded
@@ -386,7 +444,7 @@ describe a window that has already reset.
 | `mtime` as the TTL clock | No extra state file; survives restarts. |
 | Never throws | A telemetry gadget must never break a hook or status line. Worst case: it shows nothing. |
 | Synchronous fetch only when stale | Warm-cache turns stay zero-latency; only the first prompt after an idle gap pays a bounded fetch, and it shows live numbers rather than a one-turn-stale value. |
-| python3, not jq | `jq` is often missing; python3 is always present, with real JSON + datetime handling. |
+| Python, not jq | `jq` is often missing; Python is always present, with real JSON + datetime handling — and it is the one interpreter this needs on Linux, macOS and Windows alike. |
 | Secret stays in the worker | The token is read by `usage.py` and used only in the request to Anthropic's own API. The cache holds only percentages and reset times. |
 
 ## Failure modes
