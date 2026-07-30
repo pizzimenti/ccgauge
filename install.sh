@@ -39,6 +39,19 @@ statusline_is_ours() {
            "$STATUSLINE_DST" 2>/dev/null
 }
 
+# Does this path name a Python, by name alone? Verification runs the registered
+# interpreter to prove it works, and `-c` is inert only for programs that mean
+# by it what Python does -- `shutdown -c` cancels a pending shutdown. A name
+# check before the probe keeps --check from executing an arbitrary binary out of
+# settings.json, which is a file the user hand-edits and we do not control.
+looks_like_python() {
+  case "$(basename "${1:-}")" in
+    python|python2|python3|python3.*|py|pypy|pypy3)           return 0 ;;
+    python.exe|pythonw.exe|python3.exe|py.exe)                return 0 ;;
+    *)                                                        return 1 ;;
+  esac
+}
+
 CHECK_ONLY=0
 TAKE_STATUSLINE=0
 for arg in "$@"; do
@@ -811,6 +824,14 @@ try:
     block = cfg.get("statusLine") if isinstance(cfg, dict) else None
     if isinstance(block, dict):
         cmd = block.get("command") or ""
+    elif block is not None:
+        # A statusLine that is not an object is still a configured status line --
+        # the writer preserves it verbatim for exactly that reason. Reading it as
+        # "nothing is configured" would waive the execute bit on a file the value
+        # may name outright, which is the embedded-path hole wearing a different
+        # hat. str(), not json.dumps(): this is only ever substring-matched, and
+        # dumps() escapes the backslashes in a Windows path out of matching range.
+        cmd = str(block)
 except Exception:
     cmd = ""
 
@@ -1152,20 +1173,56 @@ try:
     w = shlex.split(c)
 except ValueError:
     w = c.split()
-interp = w[0] if w else ""
-script = next((x for x in w[1:] if x.endswith(".py")), "")
+
+# Find the interpreter by *recognising* it, not by walking to its position.
+# `PYTHONUTF8=1 python3 <usage.py> hookline` and `env -u FOO python3 <usage.py>
+# hookline` are both working registrations, and reaching the program positionally
+# means re-implementing shell prefix grammar. `env -u NAME` alone was enough to
+# defeat an attempt at that: -u takes an argument, so the walk stopped on NAME
+# and reported the interpreter as "FOO" for a hook that fires perfectly well.
+#
+# Scanning for the python-looking token has no grammar to get wrong, and it is
+# also the whole of the safety rule -- verification executes the interpreter to
+# prove it works, and `-c` is inert only for programs that read it the way Python
+# does (`shutdown -c` cancels a shutdown). Recognising by name means the verifier
+# can only ever run something it identified, never whatever occupies a position
+# in a file the user hand-edits.
+def _py(tok):
+    b = os.path.basename(tok).lower()
+    if b.endswith(".exe"):
+        b = b[:-4]
+    return (b in ("python", "python2", "python3", "py", "pypy", "pypy3",
+                  "pythonw")
+            or b.startswith("python3."))
+
+interp = next((x for x in w if _py(x)), "")
+script = next((x for x in w if x.endswith(".py")), "")
 print(interp + "\x1f" + script)
 PY
 )
   hook_interp=${hook_parts%%$'\x1f'*}
   hook_script=${hook_parts#*$'\x1f'}
   if [ -z "$hook_interp" ]; then
-    fail "could not read the hook command in settings.json to check it"
+    # No token in the command was recognisable as a Python. `/bin/false
+    # <usage.py> hookline` lands here: it resolves and the file exists, so the
+    # older checks passed it while Claude Code got no hook output at all.
+    fail "no Python interpreter in the hook command: $hook_cmd_stored"
+    printf '        --check will not run an unrecognised program to find out what it does —\n'
+    printf '        fix the command in settings.json, or invoke the hook yourself to test it\n'
   elif ! command -v "$hook_interp" > /dev/null 2>&1; then
     fail "hook interpreter not found: $hook_interp"
     printf '        Claude Code cannot fire the hook — fix the command in settings.json\n'
   elif [ -n "$hook_script" ] && [ ! -f "$hook_script" ]; then
     fail "hook script does not exist: $hook_script"
+  elif ! looks_like_python "$hook_interp"; then
+    # Checked by name *before* running anything. The probe below is the only
+    # place --check executes a program it did not choose, and `-c` is inert only
+    # for things that read it the way Python does: `shutdown -c` cancels a
+    # pending shutdown. settings.json is hand-edited and not ours, so a name we
+    # do not recognise is reported, never executed to find out.
+    fail "hook interpreter does not look like Python: $hook_interp"
+    printf '        --check will not run an unrecognised program to find out — fix the\n'
+    printf '        command in settings.json, or invoke the hook yourself to test it\n'
   elif ! "$hook_interp" -c 'pass' > /dev/null 2>&1; then
     # Resolving a name proves nothing about what it does: `/bin/false <usage.py>
     # hookline` passes `command -v` and the file check, then produces no hook
