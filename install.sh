@@ -23,6 +23,22 @@ HOOK_DST="$CONFIG_DIR/hooks/usage-line.sh"
 USAGE_DST="$CONFIG_DIR/usage.py"
 STATUSLINE_DST="$CONFIG_DIR/statusline.sh"
 
+# Is the file at $STATUSLINE_DST ccgauge's own copy, or a status line the user
+# wrote that happens to live at that path? Claude Code's /statusline command
+# writes there too, so the path settles nothing and the answer is needed twice:
+# to decide whether the installer may overwrite the file, and to decide whether
+# verification may run it and judge it by whether it draws ccgauge's gauges.
+# Getting the second one wrong declares a perfectly good install broken.
+#
+# The second pattern recognises copies from versions that shipped before the
+# marker existed, so an update still lands on an install that predates it.
+statusline_is_ours() {
+  [ -e "$STATUSLINE_DST" ] || return 1
+  grep -qF -e 'ccgauge-statusline-marker' \
+           -e "ccgauge's status line for Claude Code" \
+           "$STATUSLINE_DST" 2>/dev/null
+}
+
 CHECK_ONLY=0
 TAKE_STATUSLINE=0
 for arg in "$@"; do
@@ -46,6 +62,106 @@ PY_PRELUDE='
 import os, shlex
 
 
+def _words(cmd):
+    """Split a command string the way a shell would, never raising."""
+    try:
+        return shlex.split(cmd)
+    except ValueError:
+        return cmd.split()
+
+
+def _resolves_to(word, rt):
+    """Does this single word name `rt` (already resolved)?
+
+    Absolute paths only. A relative word resolves against the working directory
+    of whichever process asks — for the installer that is wherever it happened
+    to be launched, but Claude Code runs hook and status-line commands from the
+    project directory, where the same word names something else or nothing at
+    all. Matching one reports a registration as ours and verifies it green while
+    it is unrunnable in practice.
+    """
+    return bool(word) and os.path.isabs(word) and os.path.realpath(word) == rt
+
+
+def invokes_solely(cmd, target):
+    """Is `cmd` nothing but an invocation of `target`?
+
+    This is the delete/rewrite criterion, and it is deliberately stricter than
+    refers_to. That looseness below is right for "is ccgauge registered here"
+    and wrong for "may I remove this": a command like
+    `audit.sh --watch .../usage-line.sh` refers to us without being ours, and
+    counting it as a duplicate deletes a hook we never owned.
+    """
+    if not isinstance(cmd, str) or not cmd.strip():
+        return False
+    rt = os.path.realpath(target)
+    if _resolves_to(cmd.strip(), rt):
+        return True                  # the whole string is the path (<= 0.7.0)
+    words = _words(cmd)
+    return len(words) == 1 and _resolves_to(words[0], rt)
+
+
+def is_hook_command(cmd, hook_path, usage_py):
+    """Recognise either installer spelling of the UserPromptSubmit hook.
+
+    install.sh registers hooks/usage-line.sh; install.ps1 registers
+    `python "<usage.py>" hookline`. One machine can see both — Git Bash is a
+    platform install.sh supports and install.ps1 targets the same config dir —
+    and a registration written by the other installer has to be recognised
+    rather than appended alongside. Two live registrations fire the hook twice
+    a turn, injecting two [usage] blocks and doubling the requests against an
+    endpoint that rate-limits hard.
+
+    The usage.py spelling requires the mode as the very next token, which is the
+    shape install.ps1 matches too, so a command that merely mentions usage.py
+    somewhere is never claimed.
+    """
+    if refers_to(cmd, hook_path):
+        return True
+    if not isinstance(cmd, str) or not usage_py:
+        return False
+    words = _words(cmd)
+    rt = os.path.realpath(usage_py)
+    return any(_resolves_to(w, rt) and words[i + 1] in ("hookline", "line")
+               for i, w in enumerate(words[:-1]))
+
+
+def invokes_hook_solely(cmd, hook_path, usage_py):
+    """The prune criterion, spanning both installer spellings.
+
+    Either the bare usage-line.sh path, or an interpreter running usage.py in
+    its hook mode and nothing else. Requiring the leading word to be a python
+    and everything before the script to be a flag keeps a user wrapper that
+    chains our hook out of the deletion set.
+    """
+    if invokes_solely(cmd, hook_path):
+        return True
+    if not isinstance(cmd, str) or not usage_py:
+        return False
+    words = _words(cmd)
+    if len(words) < 3 or words[-1] not in ("hookline", "line"):
+        return False
+    head = os.path.basename(words[0]).lower()
+    if not (head.startswith("python") or head.startswith("py.") or head == "py"):
+        return False
+    if any(not w.startswith("-") for w in words[1:-2]):
+        return False
+    return _resolves_to(words[-2], os.path.realpath(usage_py))
+
+
+def script_target(cmd):
+    """The script path a command runs, if it names one.
+
+    Used only to report on a registration, never to claim it.
+    """
+    if not isinstance(cmd, str):
+        return ""
+    for w in _words(cmd):
+        if w.endswith(".sh") or w.endswith(".py"):
+            return w
+    return ""
+
+
 def refers_to(cmd, target):
     """Does this command string invoke `target`, however it was quoted?
 
@@ -64,13 +180,9 @@ def refers_to(cmd, target):
     if not isinstance(cmd, str) or not cmd.strip():
         return False
     rt = os.path.realpath(target)
-    if os.path.realpath(cmd) == rt:
+    if _resolves_to(cmd.strip(), rt):
         return True
-    try:
-        words = shlex.split(cmd)
-    except ValueError:
-        words = cmd.split()
-    return any(os.path.realpath(w) == rt for w in words if w)
+    return any(_resolves_to(w, rt) for w in _words(cmd))
 
 
 def dget(obj, key, default=None):
@@ -157,7 +269,17 @@ esac
 if [ "$CHECK_ONLY" -eq 0 ]; then
   echo
   echo "ccgauge: installing into $CONFIG_DIR"
-  mkdir -p "$CONFIG_DIR/hooks"
+  # Guarded like every other write below. Unguarded, an uncreatable config dir
+  # (read-only parent, a bad mount, a typo under a root-owned path) aborts the
+  # run under `set -e` with a bare `mkdir:` line — no FAIL, no failure count, no
+  # "nothing was installed" summary.
+  if ! mkdir -p "$CONFIG_DIR/hooks" 2>/dev/null; then
+    fail "could not create $CONFIG_DIR/hooks"
+    printf '        check that %s is writable, or set CLAUDE_CONFIG_DIR.\n' "$CONFIG_DIR"
+    echo
+    printf '\033[0;31mccgauge: nothing was installed or changed.\033[0m\n' >&2
+    exit 1
+  fi
 
   # Back up anything at a destination that differs from what we are about to
   # write. No content marker: an earlier version keyed on "does the file contain
@@ -186,8 +308,27 @@ if [ "$CHECK_ONLY" -eq 0 ]; then
     fi
     warn "existing $(basename "$dst") differs — backed it up to $(basename "$b")"
   }
+  # Decide whether statusline.sh may be written at all, BEFORE anything touches
+  # it. That path is not a name ccgauge owns — it is exactly where Claude Code's
+  # own /statusline command writes — so being there proves nothing about who put
+  # it there. Writing it unconditionally makes --statusline meaningless for
+  # everyone whose status line sits at the default path, and re-clobbers it on
+  # every documented `git pull && ./install.sh`.
+  #
+  # The marker decides *whether to write*, never whether to back up: backups stay
+  # keyed on differing content, which is the honest test and the reason keying
+  # the backup on a marker was wrong. The second pattern recognises copies from
+  # ccgauge versions that shipped before the marker existed, so an update still
+  # lands on an install that predates it.
+  install_statusline=1
+  if [ -e "$STATUSLINE_DST" ] && [ "$TAKE_STATUSLINE" -eq 0 ] && ! statusline_is_ours; then
+    install_statusline=0
+  fi
+
   backed_up=1
-  backup_if_differs "$STATUSLINE_DST" "$HERE/statusline.sh" || backed_up=0
+  if [ "$install_statusline" -eq 1 ]; then
+    backup_if_differs "$STATUSLINE_DST" "$HERE/statusline.sh" || backed_up=0
+  fi
   backup_if_differs "$HOOK_DST"       "$HERE/hooks/usage-line.sh" || backed_up=0
   backup_if_differs "$USAGE_DST"      "$HERE/usage.py" || backed_up=0
   if [ "$backed_up" -eq 0 ]; then
@@ -206,10 +347,18 @@ if [ "$CHECK_ONLY" -eq 0 ]; then
   # the config dir then source and destination are the same file and the `rm`
   # deletes the source before it can be read.
   install_file() {
-    local src="$1" dst="$2" t
+    local src="$1" dst="$2" t mode
     if [ -e "$dst" ] && [ "$(readlink -f "$src" 2>/dev/null)" = "$(readlink -f "$dst" 2>/dev/null)" ]; then
       chmod +x "$dst" 2>/dev/null || true
       return 0                      # already the same file; nothing to do
+    fi
+    # Severing the link is the deliberate choice (see above), but it must not be
+    # silent. The content-diff backup says nothing when the link already pointed
+    # at identical content, so without this a dotfiles checkout is quietly
+    # detached from ~/.claude and every later `git pull` there stops mattering.
+    if [ -L "$dst" ]; then
+      warn "$(basename "$dst") was a symlink to $(readlink "$dst")"
+      warn "replaced it with a regular file — your link is gone, the target is untouched"
     fi
     t="$dst.ccgauge-tmp.$$"
     if ! cp "$src" "$t" 2>/dev/null; then
@@ -217,9 +366,32 @@ if [ "$CHECK_ONLY" -eq 0 ]; then
       fail "could not write $dst (is $CONFIG_DIR writable?)"
       return 1
     fi
+    # Carry the destination permission bits across. `cp` gave the temp file the
+    # *source* mode, so replacing the entry silently re-grants whatever the repo
+    # ships: a usage.py deliberately kept at 0700 comes back 0755 on every
+    # update. `chmod +x` with no `who` is no better — it sets the execute bit for
+    # group and other as well. These files run on every turn; keep the mode the
+    # user chose and add only the owner execute bit we actually need.
+    mode=""
+    if [ -f "$dst" ]; then
+      mode=$(DST="$dst" python3 -c \
+        'import os; print("%o" % (os.stat(os.environ["DST"]).st_mode & 0o7777))' \
+        2>/dev/null || echo "")
+    fi
     # Guarded: an unguarded chmod would abort the run under `set -e` with no
     # diagnostic and leave the temp file behind.
-    if ! chmod +x "$t" 2>/dev/null || ! mv -f "$t" "$dst" 2>/dev/null; then
+    if [ -n "$mode" ]; then
+      if ! chmod "$mode" "$t" 2>/dev/null || ! chmod u+x "$t" 2>/dev/null; then
+        rm -f "$t"
+        fail "could not set permissions on $dst"
+        return 1
+      fi
+    elif ! chmod +x "$t" 2>/dev/null; then
+      rm -f "$t"
+      fail "could not make $dst executable"
+      return 1
+    fi
+    if ! mv -f "$t" "$dst" 2>/dev/null; then
       rm -f "$t"
       fail "could not replace $dst"
       return 1
@@ -230,13 +402,21 @@ if [ "$CHECK_ONLY" -eq 0 ]; then
   copied=1
   install_file "$HERE/usage.py"            "$USAGE_DST" || copied=0
   install_file "$HERE/hooks/usage-line.sh" "$HOOK_DST"  || copied=0
-  install_file "$HERE/statusline.sh"       "$STATUSLINE_DST" || copied=0
+  if [ "$install_statusline" -eq 1 ]; then
+    install_file "$HERE/statusline.sh"     "$STATUSLINE_DST" || copied=0
+  fi
   if [ "$copied" -eq 0 ]; then
     echo
     printf '\033[0;31mccgauge: could not install the files — see above.\033[0m\n' >&2
     exit 1
   fi
-  ok "copied usage.py, hooks/usage-line.sh, statusline.sh"
+  if [ "$install_statusline" -eq 1 ]; then
+    ok "copied usage.py, hooks/usage-line.sh, statusline.sh"
+  else
+    ok "copied usage.py, hooks/usage-line.sh"
+    warn "$STATUSLINE_DST is not ccgauge's — left it exactly as it is"
+    warn "take it over with: ./install.sh --statusline"
+  fi
 
   if [ ! -f "$SETTINGS" ]; then
     # `-f` is false for a dangling symlink too, and the redirect would then fail
@@ -268,6 +448,7 @@ if [ "$CHECK_ONLY" -eq 0 ]; then
   # modified file — has destroyed the only copy of your original. Nothing here
   # ever overwrites an existing backup, and a no-op run leaves no litter.
   HOOK_PATH="$HOOK_DST" STATUSLINE_PATH="$STATUSLINE_DST" \
+  USAGE_PATH="$USAGE_DST" STATUSLINE_INSTALLED="$install_statusline" \
   TAKE_STATUSLINE="$TAKE_STATUSLINE" \
   python3 - "$SETTINGS" <<'PY' || settings_write_failed=1
 import datetime, json, os, shlex, shutil, sys
@@ -285,12 +466,23 @@ path = os.path.realpath(sys.argv[1])
 # never fires, silently.
 hook_path = os.environ["HOOK_PATH"]
 sl_path = os.environ["STATUSLINE_PATH"]
+usage_py = os.environ.get("USAGE_PATH", "")
 hook_cmd = shlex.quote(hook_path)
 statusline_cmd = "bash " + shlex.quote(sl_path)
 take_statusline = os.environ.get("TAKE_STATUSLINE") == "1"
+# False when the file at sl_path is the user's own script, which we refused to
+# overwrite. Registering it anyway would point Claude Code's status line at
+# *their* script and then report it as ccgauge's.
+statusline_installed = os.environ.get("STATUSLINE_INSTALLED", "1") == "1"
 
 try:
-    with open(path) as fh:
+    # utf-8-sig, not utf-8: a BOM is routine on Windows — Notepad and
+    # PowerShell's Set-Content both write one — and Git Bash is a platform this
+    # installer supports. Plain open() makes json.loads fail on column 1 of a
+    # perfectly valid file, and the run dies *after* the three files are copied,
+    # with a message telling the user to fix JSON that was never broken.
+    # install.ps1 and usage.py already read their JSON this way.
+    with open(path, encoding="utf-8-sig") as fh:
         original = fh.read()
     cfg = json.loads(original)
     if not isinstance(cfg, dict):
@@ -336,11 +528,23 @@ def group_hooks(g):
     return h if isinstance(h, list) else None
 
 
+# Whether we actually altered the config. The rewrite decision hangs on this and
+# nothing else — see the note above the write below.
+changed = False
+
+# Three different questions, three different predicates, and conflating them is
+# how this loses a hook that was never ours:
+#   is_hook_command   — is ccgauge reached from here? (do not add a second)
+#   invokes_hook_solely — is this entry nothing but ccgauge? (safe to prune)
+#   invokes_solely    — is it our own script, spelled some other way? (rewrite)
 existing = [h for g in groups
             for h in (group_hooks(g) or []) if isinstance(h, dict)
-            and refers_to(h.get("command"), hook_path)]
-if len(existing) > 1:
-    print(f"  {Y}warn{X}  {len(existing)} duplicate hook registrations found — pruning to one")
+            and is_hook_command(h.get("command"), hook_path, usage_py)]
+registered = bool(existing)
+prunable = [h for h in existing
+            if invokes_hook_solely(h.get("command"), hook_path, usage_py)]
+if len(prunable) > 1:
+    print(f"  {Y}warn{X}  {len(prunable)} duplicate hook registrations found — pruning to one")
     # Keep the FIRST of our registrations rather than deleting them all and
     # appending a fresh bare group: the existing entry may carry keys we do not
     # know about (a timeout, whatever Claude Code adds next), and its group may
@@ -354,8 +558,10 @@ if len(existing) > 1:
             continue
         after = []
         for h in hs:
-            if isinstance(h, dict) and refers_to(h.get("command"), hook_path):
+            if isinstance(h, dict) \
+                    and invokes_hook_solely(h.get("command"), hook_path, usage_py):
                 if seen:
+                    changed = True
                     continue        # a duplicate; drop this one
                 seen = True
             after.append(h)
@@ -365,28 +571,40 @@ if len(existing) > 1:
             g["hooks"] = after
             kept.append(g)
     groups[:] = kept
-    existing = [True] if seen else []
 # Recognising a registration is not the same as accepting its spelling. Matching
 # the whole unquoted string stops an upgrade appending a duplicate of itself, but
 # on its own it also means a pre-0.8.0 unquoted path in a config dir containing a
 # space is declared "already registered" and the quoting fix never lands — the
 # hook stays word-split and stays broken. Recognise it, then rewrite it.
+#
+# Only our own script gets respelled. A registration install.ps1 wrote is left
+# exactly as it is: it works, the user may well be running PowerShell too, and
+# rewriting it to a bash script is a decision that belongs to whoever runs that
+# installer.
 rewrote = 0
 for g in groups:
     for h in (group_hooks(g) or []):
-        if isinstance(h, dict) and refers_to(h.get("command"), hook_path) \
+        if isinstance(h, dict) and invokes_solely(h.get("command"), hook_path) \
                 and h.get("command") != hook_cmd:
             h["command"] = hook_cmd
             h.setdefault("type", "command")
             rewrote += 1
 if rewrote:
+    changed = True
     print(f"  {G}ok{X}    rewrote {rewrote} hook registration(s) to the quoted form")
 
-if existing:
+if registered:
     if not rewrote:
-        print(f"  {G}ok{X}    UserPromptSubmit hook already registered")
+        if prunable:
+            print(f"  {G}ok{X}    UserPromptSubmit hook already registered")
+        else:
+            # Reached through a command we did not write — install.ps1, or a
+            # wrapper of the user's own. Recognised so we do not add a second
+            # live registration; left alone because it is not ours to edit.
+            print(f"  {G}ok{X}    UserPromptSubmit hook already reached from an existing entry")
 else:
     groups.append({"hooks": [{"type": "command", "command": hook_cmd}]})
+    changed = True
     print(f"  {G}ok{X}    registered UserPromptSubmit hook")
 
 # The status line is only taken over when it is absent, already ours, or the
@@ -401,13 +619,49 @@ if sl_raw is not None and sl is None:
     # Coercing it to None makes the "leave a foreign one alone" branch
     # unreachable and replaces it with no warning and no --statusline.
     current = json.dumps(sl_raw)
-if current and sl is not None and refers_to(current, sl_path):
+# A registration naming a file that is not there renders nothing, silently, on
+# every turn. Pre-0.9 installs wired statusline-snippet.sh, which this version
+# deletes, so the documented `git pull && ./install.sh` update walks straight
+# into it — and calling that "points elsewhere, fine if deliberate" hands the
+# user a dead status line over an install reported as verified.
+dead_target = ""
+if current and not (sl is not None and refers_to(current, sl_path)):
+    t = script_target(current)
+    if t and os.path.isabs(t) and not os.path.exists(t):
+        dead_target = t
+was_ours = os.path.basename(dead_target) in ("statusline-snippet.sh", "statusline.sh")
+
+if current and sl is not None and refers_to(current, sl_path) and statusline_installed:
     print(f"  {G}ok{X}    status line already registered")
+elif dead_target and was_ours and statusline_installed:
+    # A ccgauge status line from before the rename. Repointing it is a repair
+    # rather than a takeover: the file it names is gone, so there is no working
+    # configuration here to preserve.
+    replacing = current
+    block = sl if sl is not None else {}
+    block["type"] = "command"
+    block["command"] = statusline_cmd
+    cfg["statusLine"] = block
+    changed = True
+    print(f"  {G}ok{X}    repointed a ccgauge status line that named the removed "
+          f"{os.path.basename(dead_target)}")
 elif current and not take_statusline:
-    print(f"  {Y}warn{X}  leaving your existing status line alone:")
-    print(f"          {current}")
-    print( "          add ccgauge to it yourself (see the README), or take it over with:")
-    print( "              ./install.sh --statusline")
+    if dead_target:
+        print(f"  {Y}warn{X}  your status line names a file that does not exist:")
+        print(f"          {dead_target}")
+        print( "          it renders nothing at all — fix the path, or take it over with:")
+        print( "              ./install.sh --statusline")
+    else:
+        print(f"  {Y}warn{X}  leaving your existing status line alone:")
+        print(f"          {current}")
+        print( "          add ccgauge to it yourself (see the README), or take it over with:")
+        print( "              ./install.sh --statusline")
+elif not statusline_installed:
+    # The file at sl_path is the user's own script, which the copy step refused to
+    # overwrite. Registering the path anyway would aim Claude Code at their
+    # script and then report it as ccgauge rendering correctly.
+    print(f"  {Y}warn{X}  not registering a status line: {sl_path} is your own script")
+    print( "          take it over with: ./install.sh --statusline")
 else:
     replacing = current
     # Set only the keys we own, so any sibling key in an existing statusLine
@@ -416,10 +670,20 @@ else:
     block["type"] = "command"
     block["command"] = statusline_cmd
     cfg["statusLine"] = block
+    changed = True
     print(f"  {G}ok{X}    registered status line")
 
-updated = json.dumps(cfg, indent=2) + "\n"
-if updated == original:
+# Rewrite only when something actually changed, tracked as we went. Comparing
+# our own rendering against the file text instead means every settings.json that
+# is not already byte-identical to json.dumps(indent=2) gets rewritten, reflowed
+# and re-encoded on a run that changed nothing — collapsing the formatting the
+# user chose and leaving a backup behind for it.
+#
+# ensure_ascii=False for the same reason: the default escapes every non-ASCII
+# character it passes through, so an accented word or an em dash anywhere in the
+# file comes back mangled by an installer that had no business touching it.
+updated = json.dumps(cfg, indent=2, ensure_ascii=False) + "\n"
+if not changed:
     print(f"  {G}ok{X}    settings.json already correct — not rewritten")
     sys.exit(0)
 
@@ -459,7 +723,10 @@ try:
     mode = os.stat(path).st_mode & 0o7777
 except OSError:
     mode = None
-with open(tmp, "w") as fh:
+# Explicit utf-8: ensure_ascii=False above means `updated` can carry non-ASCII,
+# and the default encoding follows the ambient locale, which on a C/POSIX locale
+# raises UnicodeEncodeError mid-write.
+with open(tmp, "w", encoding="utf-8") as fh:
     fh.write(updated)
 if mode is not None:
     try:
@@ -490,10 +757,23 @@ done
 
 # usage.py must import and run. `bar` touches no state and no network, so it is
 # the cheapest possible end-to-end proof that the interpreter can run the file.
-if bar_out=$(python3 "$USAGE_DST" bar 50 2>&1) && [ -n "$bar_out" ]; then
+#
+# stderr goes to its own file rather than being folded in, and the test is for an
+# actual bar glyph rather than for non-emptiness — the same guard the status-line
+# check further down explains and this one used to skip. Folded together, any
+# interpreter that writes to stderr at startup (PYTHONWARNINGS, a distro
+# DeprecationWarning from a .pth, a Windows console-encoding notice) satisfies
+# "non-empty" on its own, so a bar that renders nothing reports ok. usage.py
+# cannot be relied on to signal it either: it suppresses its own exceptions and
+# exits 0 by contract.
+bar_err=$(mktemp)
+CLEANUP+=("$bar_err")
+if bar_out=$(python3 "$USAGE_DST" bar 50 2>"$bar_err") \
+   && printf '%s' "$bar_out" | grep -q '[█▓▒░]'; then
   ok "usage.py runs               $bar_out"
 else
-  fail "usage.py produced no output — run: python3 $USAGE_DST bar 50"
+  fail "usage.py drew no bar — run: python3 $USAGE_DST bar 50"
+  [ -s "$bar_err" ] && printf '        %s\n' "$(head -2 "$bar_err")"
 fi
 
 # Its never-raise contract: every mode must exit 0 even with no cache at all.
@@ -521,14 +801,19 @@ done
 # the failure count. A status line pointing somewhere *else* is a warning rather
 # than a failure — the README documents keeping your own — but no status line at
 # all means half of ccgauge has nowhere to render.
+if statusline_is_ours; then sl_is_ours=1; else sl_is_ours=0; fi
 settings_report=$(
   SETTINGS="$SETTINGS" HOOK_DST="$HOOK_DST" STATUSLINE_DST="$STATUSLINE_DST" \
+  USAGE_DST="$USAGE_DST" SL_IS_OURS="$sl_is_ours" \
   python3 <<'PY'
 import json, os, shlex, sys
 
 G, Y, R, X = "\033[0;32m", "\033[0;33m", "\033[0;31m", "\033[0m"
 try:
-    cfg = json.load(open(os.environ["SETTINGS"]))
+    # utf-8-sig: a BOM is routine on Windows and is not a broken file. Reading it
+    # as plain utf-8 reports a valid settings.json as invalid and sends the user
+    # off to restore a backup they do not need.
+    cfg = json.load(open(os.environ["SETTINGS"], encoding="utf-8-sig"))
 except Exception as exc:
     print(f"  {R}FAIL{X}  settings.json is not valid JSON ({exc})")
     print("        restore it from the newest settings.json.*.bak beside it")
@@ -536,6 +821,7 @@ except Exception as exc:
 print(f"  {G}ok{X}    settings.json is valid JSON")
 
 hook, sl = os.environ["HOOK_DST"], os.environ["STATUSLINE_DST"]
+usage_py = os.environ.get("USAGE_DST", "")
 
 
 exec(os.environ["PY_PRELUDE"])   # refers_to() — single definition, see the top
@@ -550,14 +836,24 @@ if not isinstance(groups, list):
     if groups is not None:
         print(f"  {Y}warn{X}  hooks.UserPromptSubmit is not a list — cannot read it")
     groups = []
+# Counted across both installer spellings. Counting only usage-line.sh misses the
+# `python <usage.py> hookline` form install.ps1 writes, so a machine carrying one
+# of each fires the hook twice a turn while this check reports a single clean
+# registration.
 matches = [h for g in groups
            for h in (dget(g, "hooks") if isinstance(dget(g, "hooks"), list) else [])
-           if isinstance(h, dict) and refers_to(h.get("command"), hook)]
+           if isinstance(h, dict) and is_hook_command(h.get("command"), hook, usage_py)]
 registered = bool(matches)
 if len(matches) > 1:
     print(f"  {Y}warn{X}  hook is registered {len(matches)} times — it will fire "
           f"{len(matches)}x per turn")
     print( "        re-run ./install.sh (without --check) to prune the duplicates")
+for h in matches:
+    rel = script_target(h.get("command"))
+    if rel and not os.path.isabs(rel):
+        print(f"  {Y}warn{X}  hook command uses a relative path: {rel}")
+        print( "        Claude Code runs it from the project directory, not from here,")
+        print( "        so it will usually not resolve — re-run ./install.sh to fix it")
 print(f"  {G}ok{X}    UserPromptSubmit hook is registered" if registered
       else f"  {R}FAIL{X}  UserPromptSubmit hook is NOT registered")
 
@@ -567,9 +863,31 @@ cmd = dget(sl_raw, "command") or ""
 # writer deliberately leaves it alone, so the verifier must not call it missing.
 if not cmd and sl_raw is not None and not isinstance(sl_raw, dict):
     cmd = json.dumps(sl_raw)
-ours = refers_to(cmd, sl) and isinstance(sl_raw, dict)
+# Registered at our path AND the file there is actually ours. The registration
+# alone is not ownership: Claude Code writes its own /statusline script to that
+# same path, and claiming it renders ccgauge is how a preserved user status line
+# gets reported as a working ccgauge install.
+sl_is_ours_file = os.environ.get("SL_IS_OURS") == "1"
+ours = refers_to(cmd, sl) and isinstance(sl_raw, dict) and sl_is_ours_file
+target = script_target(cmd)
+sl_broken = False
 if ours:
     print(f"  {G}ok{X}    status line is registered")
+elif cmd and refers_to(cmd, sl) and not sl_is_ours_file:
+    print(f"  {Y}warn{X}  status line at {sl} is your own script, not ccgauge's")
+    print( "        left alone on purpose — take it over with: ./install.sh --statusline")
+elif cmd and target and not os.path.isabs(target):
+    # Cannot be verified from here and will not resolve there: this process runs
+    # wherever the installer was launched, Claude Code runs the status line from
+    # the project directory. Resolving it against our own cwd is what let a
+    # relative registration be reported as ours and rendered green.
+    print(f"  {Y}warn{X}  status line uses a relative path: {target}")
+    print( "        Claude Code runs it from the project directory, not from here,")
+    print( "        so it will usually render nothing — re-run ./install.sh to fix it")
+elif cmd and target and os.path.isabs(target) and not os.path.exists(target):
+    sl_broken = True
+    print(f"  {R}FAIL{X}  status line names a file that does not exist: {target}")
+    print( "        it renders nothing every turn — re-run ./install.sh without --check")
 elif cmd:
     print(f"  {Y}warn{X}  status line points elsewhere: {cmd}")
     print( "        (fine if that is deliberate — see the README)")
@@ -577,12 +895,12 @@ else:
     print(f"  {R}FAIL{X}  no status line configured — the gauges have nowhere to render")
     print( "        re-run ./install.sh without --check")
 
-sys.exit(0 if registered and (ours or cmd) else 1)
+sys.exit(0 if registered and (ours or cmd) and not sl_broken else 1)
 PY
 ) && settings_ok=1 || settings_ok=0
 printf '%s\n' "$settings_report"
 [ "$settings_ok" -eq 1 ] || \
-  fail "settings.json is unreadable, or is missing the hook or the status line"
+  fail "settings.json is unreadable, or its hook or status line is missing or broken"
 
 # Do the one forced refresh HERE, before the render checks, and report it further
 # down. Ordering matters for the request count: the hook runs `usage.py line`,
@@ -612,19 +930,25 @@ print(json.dumps({"workspace": {"current_dir": os.environ["PWD_VAL"]},
 # quoting for us. Invoking directly is what let an unquoted, word-splittable
 # hook command pass verification while being unusable in practice.
 #
-# CCGAUGE_USAGE_PY is cleared so these exercise the usage.py we just installed
-# rather than whatever an ambient environment points at.
+# CCGAUGE_USAGE_PY is deliberately NOT cleared. Clearing it makes these checks
+# exercise a different file from the one that will actually run: both scripts
+# read the variable at render time and Claude Code inherits whatever the user
+# exported, so a variable pointing at a stale checkout produced a green install
+# and permanently blank gauges. Verify what will run, and say so when it is not
+# the file we just copied.
+#
 # Select *ccgauge's own* entries, not simply the first one present. Picking the
 # first UserPromptSubmit hook runs a stranger's script and then fails it for not
 # printing [usage]; taking the statusLine unconditionally runs the status line we
 # just deliberately preserved and fails it for not drawing our glyphs. Both
 # declare a correct install broken.
-hook_cmd_stored=$(SETTINGS="$SETTINGS" TARGET="$HOOK_DST" python3 -c '
+hook_cmd_stored=$(SETTINGS="$SETTINGS" TARGET="$HOOK_DST" USAGE_DST="$USAGE_DST" python3 -c '
 import json, os
 exec(os.environ["PY_PRELUDE"])
-cfg = json.load(open(os.environ["SETTINGS"]))
+cfg = json.load(open(os.environ["SETTINGS"], encoding="utf-8-sig"))
 groups = dget(dget(cfg, "hooks"), "UserPromptSubmit")
 target = os.environ["TARGET"]
+usage_py = os.environ.get("USAGE_DST", "")
 found = ""
 # Every level type-guarded, and `hooks` iterated only when it is really a list.
 # Without that guard a malformed sibling group — {"hooks": 5} — raises TypeError,
@@ -636,7 +960,7 @@ if isinstance(groups, list):
         if not isinstance(hs, list):
             continue
         for h in hs:
-            if isinstance(h, dict) and refers_to(h.get("command"), target):
+            if isinstance(h, dict) and is_hook_command(h.get("command"), target, usage_py):
                 found = h.get("command", "")
                 break
         if found:
@@ -645,26 +969,74 @@ print(found)' 2>/dev/null || echo "")
 
 # Empty unless the configured status line is ours; a preserved foreign one is
 # reported as skipped rather than executed and judged by our criteria.
+#
+# Both halves have to hold: the registration must name our path AND the file
+# sitting there must actually be ours. Checking only the registration runs a
+# user script that happens to live at the default path and then fails it for not
+# drawing ccgauge's gauges — a correct install reported as broken.
+if ! statusline_is_ours; then
+  sl_cmd_stored=""
+else
 sl_cmd_stored=$(SETTINGS="$SETTINGS" TARGET="$STATUSLINE_DST" python3 -c '
 import json, os
 exec(os.environ["PY_PRELUDE"])
-cfg = json.load(open(os.environ["SETTINGS"]))
+cfg = json.load(open(os.environ["SETTINGS"], encoding="utf-8-sig"))
 sl = cfg.get("statusLine")
 cmd = (sl.get("command") or "") if isinstance(sl, dict) else ""
 print(cmd if refers_to(cmd, os.environ["TARGET"]) else "")' 2>/dev/null || echo "")
+fi
 
 hook_err=$(mktemp); sl_err=$(mktemp)
 CLEANUP+=("$hook_err" "$sl_err")
 
+# Say plainly when the checks below are exercising a file we did not install.
+if [ -n "${CCGAUGE_USAGE_PY:-}" ]; then
+  warn "CCGAUGE_USAGE_PY is set: $CCGAUGE_USAGE_PY"
+  warn "the checks below exercise that file, because Claude Code will inherit it too"
+  if [ "$CCGAUGE_USAGE_PY" != "$USAGE_DST" ]; then
+    warn "it is NOT the usage.py this installer manages — unset it if that is unintended"
+  fi
+fi
+
+# Whether the stored hook command runs our script (which honours
+# CCGAUGE_USAGE_PY) or invokes usage.py directly, as install.ps1 registers it.
+# Only the former can be exercised against a stub.
+if printf '%s' "$hook_cmd_stored" | grep -qF "$HOOK_DST"; then
+  hook_via_script=1
+else
+  hook_via_script=0
+fi
+
 if [ -z "$hook_cmd_stored" ]; then
   fail "no hook command in settings.json to exercise"
+elif [ "$CHECK_ONLY" -eq 1 ] && [ "$hook_via_script" -eq 0 ]; then
+  # A direct usage.py invocation ignores CCGAUGE_USAGE_PY, so there is no way to
+  # run it here without the network call --check promises not to make.
+  ok "hook registered (a direct usage.py call — not executed under --check)"
 elif [ "$CHECK_ONLY" -eq 1 ]; then
-  # Running the hook is not a read-only act: it logs a prompt event and detaches
-  # a background refresh that can hit the endpoint. --check has to stay safe to
-  # run repeatedly while diagnosing a rate-limit problem, so it stops at "the
-  # hook is present, executable and registered".
-  ok "hook registered (not executed — --check makes no network call)"
-elif hook_out=$(printf '%s' "$SAMPLE" | env -u CCGAUGE_USAGE_PY sh -c "$hook_cmd_stored" 2>"$hook_err") \
+  # Run the real command, with usage.py stubbed out. "Present, executable and
+  # registered" proves nothing about whether the shell can actually run the
+  # thing: a CRLF checkout dies with `bad interpreter: ...^M` and satisfies all
+  # three, so the one failure a user runs --check to diagnose was the one it
+  # could not see. The stub keeps the run free of network calls and history
+  # writes, which is what makes --check safe to repeat while diagnosing a
+  # rate limit.
+  hook_stub=$(mktemp)
+  CLEANUP+=("$hook_stub")
+  printf 'print("[usage] --check stub")\n' > "$hook_stub"
+  if hook_out=$(printf '%s' "$SAMPLE" \
+                | CCGAUGE_USAGE_PY="$hook_stub" CCGAUGE_NO_LOG=1 \
+                  sh -c "$hook_cmd_stored" 2>"$hook_err") \
+     && printf '%s' "$hook_out" | grep -q '\[usage\]'; then
+    ok "hook runs (usage.py stubbed — --check makes no network call)"
+  else
+    fail "hook command failed to run — try: echo '{}' | sh -c $hook_cmd_stored"
+    [ -s "$hook_err" ] && printf '        %s\n' "$(head -2 "$hook_err")"
+  fi
+# CCGAUGE_NO_LOG, because this run is synthetic: without it every install and
+# every update appends a fabricated prompt event to usage-log.jsonl, and
+# `usage.py log` then reports those install-check entries as real history.
+elif hook_out=$(printf '%s' "$SAMPLE" | CCGAUGE_NO_LOG=1 sh -c "$hook_cmd_stored" 2>"$hook_err") \
      && printf '%s' "$hook_out" | grep -q '\[usage\]'; then
   ok "hook produces a context line"
 else
@@ -681,7 +1053,7 @@ if [ -z "$sl_cmd_stored" ]; then
   # Judging theirs by whether it draws ccgauge's glyphs would fail a setup the
   # README explicitly supports.
   ok "status line is not ccgauge's — not exercised"
-elif ! sl_out=$(printf '%s' "$SAMPLE" | env -u CCGAUGE_USAGE_PY sh -c "$sl_cmd_stored" 2>"$sl_err"); then
+elif ! sl_out=$(printf '%s' "$SAMPLE" | sh -c "$sl_cmd_stored" 2>"$sl_err"); then
   fail "status line failed to run — try: echo '{}' | sh -c $sl_cmd_stored"
   [ -s "$sl_err" ] && printf '        %s\n' "$(head -2 "$sl_err")"
 # Assert on ccgauge's OWN fragment, not merely on a bar glyph. The sample payload

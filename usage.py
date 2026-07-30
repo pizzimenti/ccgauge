@@ -28,8 +28,9 @@ Modes (argv[1]):
     refresh  (default) -- fetch only if cache is stale & not in cooldown
     line                -- one-line snapshot for the UserPromptSubmit hook;
                            does one synchronous fetch first if the cache is
-                           stale (missing / idle past STALE_SECONDS), so the
-                           first prompt after a break shows live numbers
+                           missing or past TTL_SECONDS, so the first prompt
+                           after a break shows live numbers rather than the
+                           value the previous turn's background refresh left
     hookline            -- `line`, then a detached background `refresh` to warm
                            the cache for the next turn: the whole hook in one
                            command, for platforms without usage-line.sh (the
@@ -391,7 +392,14 @@ def log_event(event, **fields):
     own, but the CRT emulates append with a seek-then-write, which isn't. The
     lock is held for at most one ~1 MiB read+write (milliseconds). If no lock
     can be taken, degrade to an unlocked append.
+
+    CCGAUGE_NO_LOG suppresses the write entirely. install.sh sets it while it
+    exercises the real hook to prove the install works: that run is synthetic,
+    and without this it appends a fabricated prompt event that `usage.py log`
+    then reports back as genuine session history — every install, every update.
     """
+    if os.environ.get("CCGAUGE_NO_LOG") == "1":
+        return
     with contextlib.suppress(Exception):
         rec = {
             "ts": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
@@ -789,22 +797,29 @@ def cmd_line():
         cwd = _tilde(cwd)
     session = hook.get("session_id")
     c = read_cache()
-    # Freshen synchronously when the readout would otherwise be stale: no cache
-    # yet, or we've been idle long enough (> STALE_SECONDS) that the per-turn
-    # background warm-refresh hasn't run. Without this, the first prompt after a
-    # break prints a last-known/STALE line even though the endpoint is reachable
-    # and a good value lands ~1s later (on the *next* turn) — the exact "we're
-    # stale again" false alarm. refresh() self-throttles (returns instantly in a
-    # 429 cooldown or with a missing/expiring token, bounded by HTTP_TIMEOUT
-    # otherwise), and the gate keeps this off the hot path: an active session's
-    # cache is well under STALE_SECONDS, so this never fires and `line` stays
-    # instant. We capture refresh()'s outcome so a still-stale readout can name
-    # its real cause rather than re-deriving it afterward (which mislabels lock
-    # contention and races token/cooldown state).
+    # Freshen synchronously whenever the cache is refetchable — no cache yet, or
+    # older than TTL_SECONDS. The hook prints this line *before* it spawns the
+    # background warm-refresh, so without this gate the number shown is always
+    # one fetched on some earlier turn. Gating on STALE_SECONDS instead left a
+    # dead band between TTL_SECONDS and STALE_SECONDS: a 10-30 minute gap between
+    # prompts (a long agent turn, reading a diff, stepping away) printed data up
+    # to STALE_SECONDS old with no staleness marker, because the background
+    # refresh that would have fixed it lands *after* this line is already in
+    # context. Matching the gate to the TTL closes that band.
+    #
+    # This does not raise the request rate: refresh() self-throttles on the same
+    # TTL, the same 429 cooldown and the same lock, so the ceiling stays one
+    # request per TTL_SECONDS — the fetch just moves ahead of the print instead
+    # of trailing it. Cost is up to HTTP_TIMEOUT of prompt latency on the first
+    # prompt after an idle gap; during active back-and-forth the cache stays
+    # under TTL and this never fires, so `line` stays instant. We capture
+    # refresh()'s outcome so a still-stale readout can name its real cause
+    # rather than re-deriving it afterward (which mislabels lock contention and
+    # races token/cooldown state).
     reason = None
     prev_fa = c.get("fetched_at") if c else None
     prev_age = (_now() - prev_fa) if isinstance(prev_fa, (int, float)) else None
-    if prev_age is None or prev_age > STALE_SECONDS:
+    if prev_age is None or prev_age > TTL_SECONDS:
         outcome = {}
         fresh = refresh(outcome=outcome)
         reason = outcome.get("reason")

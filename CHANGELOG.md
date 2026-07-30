@@ -4,6 +4,100 @@ All notable changes to ccgauge are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); this project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.10.0] — 2026-07-30
+
+Hardens the installer against the configurations it can actually meet on a real
+machine — a status line the user wrote themselves, a registration written by the
+other installer, a settings.json with a BOM — and closes a staleness gap in the
+hook line. A minor rather than a patch bump because installer *behavior* changes:
+files it used to overwrite it now refuses to touch.
+
+### Changed
+
+- **`install.sh` no longer overwrites `statusline.sh` unconditionally.**
+  `$CONFIG_DIR/statusline.sh` is exactly where Claude Code's own `/statusline`
+  command writes, so a file being at that path proved nothing about who put it
+  there. The installer now writes it only when it is absent, carries ccgauge's
+  marker, or `--statusline` is passed — and says so plainly when it declines.
+  Previously the documented `git pull && ./install.sh` update path re-clobbered
+  a hand-written status line on every run, which made `--statusline` meaningless
+  for anyone whose status line sat at the default location.
+- **Hook registration is matched by three separate predicates instead of one.**
+  "Is ccgauge reached from here" (don't add a second), "is this entry nothing but
+  ccgauge" (safe to prune), and "is this our own script spelled differently"
+  (safe to rewrite) are three different questions. Conflating them meant a
+  command that merely *referenced* the hook — say a wrapper that watches it —
+  counted as a duplicate and got deleted. Matching is also restricted to
+  absolute paths now: hook commands run from the project directory, not from
+  wherever the installer happened to be launched, so a relative word that
+  matched at install time names something else at run time.
+- **A registration written by `install.ps1` is recognised and left alone.** One
+  machine can see both installers — Git Bash is a platform `install.sh` supports
+  and `install.ps1` targets the same config dir. Two live registrations fire the
+  hook twice a turn, injecting two `[usage]` blocks and doubling the request rate
+  against an endpoint that rate-limits hard.
+- **`settings.json` is rewritten only when something actually changed.** The
+  check compared the installer's own re-rendering against the file's text, so
+  any `settings.json` not already byte-identical to `json.dumps(indent=2)` was
+  reflowed, re-encoded and backed up on a run that changed nothing. Non-ASCII
+  now survives too (`ensure_ascii=False` with an explicit UTF-8 write) instead
+  of coming back escaped.
+
+### Fixed
+
+- **The hook line no longer shows numbers up to 30 minutes out of date.** The
+  `UserPromptSubmit` hook prints its line *before* it spawns the background
+  warm-refresh, so the value that reaches the model is one fetched on an earlier
+  turn. `line` compensated with a synchronous fetch, but only once the cache was
+  older than `STALE_SECONDS` (30 min) — leaving a dead band above `TTL_SECONDS`
+  (10 min) where the cache was refetchable but nothing refetched it before
+  printing. Any 10–30 minute gap between prompts — a long agent turn, reading a
+  diff, stepping away — printed stale numbers with no staleness marker, since
+  the readout was still inside the 30-minute window that would have flagged it.
+  Observed in the wild at 24 minutes: the line reported a 5-hour window at 46%
+  while the refresh it kicked off moments later wrote 87%.
+
+  The synchronous freshen is now gated on `TTL_SECONDS` instead, matching the
+  gate to the interval at which the data is actually refetchable.
+
+  This does **not** increase the request rate. `refresh()` self-throttles on the
+  same TTL, the same 429 back-off and the same non-blocking lock, so the ceiling
+  stays one request per `TTL_SECONDS`; the fetch simply moves ahead of the print
+  instead of trailing it. The cost is up to `HTTP_TIMEOUT` (6s) of prompt latency
+  on the first prompt after an idle gap. During active back-and-forth the cache
+  stays under the TTL, the gate never fires, and `line` stays instant.
+
+  The status line is unaffected — it reads the cache without refreshing, and
+  `STALE_SECONDS` still governs the stale marker and the pace-mark age budget
+  everywhere they applied before.
+
+- **The status line no longer mangles home-adjacent paths.** `short_cwd` replaced
+  `$HOME` as a bare character prefix, so with `HOME=/home/ada` a session in
+  `/home/ada2/proj` rendered as `~2/proj` — a path that is wrong and cannot be
+  pasted anywhere. It now matches on a path-component boundary, with `$HOME`
+  quoted so it is not read as a glob.
+- **Installing no longer fabricates session history.** `install.sh` exercises the
+  real hook to prove the install works; that synthetic run appended a prompt
+  event which `usage.py log` then reported back as genuine history, on every
+  install and every update. `CCGAUGE_NO_LOG=1` suppresses the write.
+- **A status line pointing at the removed `statusline-snippet.sh` is repaired
+  rather than left dead.** Pre-0.9 installs wired that file, which 0.9.0 deleted,
+  so the documented update path walked straight into a registration that renders
+  nothing at all, silently, on every turn.
+- **A `settings.json` with a UTF-8 BOM no longer fails the install.** A BOM is
+  routine on Windows — both Notepad and PowerShell's `Set-Content` write one —
+  and Git Bash is a supported platform. The run died *after* copying the three
+  files, telling the user to fix JSON that was never broken.
+- **Existing file permissions survive an update.** `install_file` re-granted
+  whatever mode the repo shipped, so a `usage.py` deliberately kept at `0700`
+  came back `0755` on every update. It now carries the destination's bits across
+  and adds only the owner execute bit. It also warns when it replaces a symlink,
+  which otherwise detached a dotfiles checkout from `~/.claude` silently.
+- **An uncreatable config dir now fails loudly.** `mkdir -p` was unguarded, so a
+  read-only parent or a bad mount aborted the run under `set -e` with a bare
+  `mkdir:` line — no `FAIL`, no failure count, no "nothing was installed"
+  summary.
+
 ## [0.9.0] — 2026-07-30
 
 Makes `./install.sh` a complete install on POSIX rather than half of one, and

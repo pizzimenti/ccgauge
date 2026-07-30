@@ -13,6 +13,13 @@
 #
 # Everything here reads ccgauge's cache only — no network — so it is safe to run
 # on every render.
+#
+# ccgauge-statusline-marker
+#   install.sh looks for this string to tell its own copy of this file from a
+#   status line you wrote yourself — $CONFIG_DIR/statusline.sh is where Claude
+#   Code's own /statusline command writes, so the name alone proves nothing.
+#   Keep the marker if you edit this file in place and updates will keep
+#   landing; delete it and the installer will leave the file alone from then on.
 
 input=$(cat)
 
@@ -57,7 +64,19 @@ sys.stdout.write("\x1f".join([cwd, model, ctx]))
 IFS=$'\x1f' read -r cwd model used_pct <<< "$parsed"
 
 # Shorten the home directory to ~
-short_cwd="${cwd/#$HOME/\~}"
+#
+# Matched on a path-component boundary, not as a bare string prefix.
+# `${cwd/#$HOME/\~}` replaces any cwd whose *characters* begin with $HOME, so
+# with HOME=/home/ada a session in /home/ada2/proj renders as "~2/proj" — a path
+# that is wrong and not copy-pasteable. Quoting $HOME in the case patterns also
+# stops it being read as a glob.
+short_cwd="$cwd"
+if [ -n "${HOME:-}" ]; then
+  case "$cwd" in
+    "$HOME")   short_cwd="~" ;;
+    "$HOME"/*) short_cwd="~${cwd#"$HOME"}" ;;
+  esac
+fi
 
 # Git branch (skip optional locks so a busy repo can never block the prompt)
 git_branch=""

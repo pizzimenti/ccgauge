@@ -252,11 +252,16 @@ it states none, rather than retry on a fixed clock.
 - **Into the assistant's context.** `hooks/usage-line.sh` is a `UserPromptSubmit`
   hook; Claude Code appends its stdout to the model's context before each turn.
   It prints the cached snapshot — instantly, with no network wait, whenever the
-  cache is warm — then kicks off a *detached* background refresh to keep the
-  cache fresh for the next turn. The one exception: if the cache has already
-  gone stale (the first prompt after an idle gap), it does a single bounded,
-  self-throttled synchronous fetch first, so you see live numbers instead of a
-  last-known readout that a refresh would replace one turn later. (On Windows
+  cache is still within its TTL — then kicks off a *detached* background refresh
+  to keep the cache fresh for the next turn. The one exception: if the cache is
+  already past the TTL (the first prompt after any idle gap), it does a single
+  bounded, self-throttled synchronous fetch first, so you see live numbers
+  instead of a readout that a refresh would replace one turn later. That
+  exception is what keeps the line honest — it lands in context *before* the
+  background refresh runs, so without it the number shown would always be one
+  turn behind. It does not raise the request rate: the synchronous fetch obeys
+  the same TTL, 429 cooldown and lock as any other, so the ceiling stays one
+  request per TTL. (On Windows
   the registered hook is `usage.py hookline` — the same two steps, print then
   detached warm-refresh, with the detachment done by `usage.py` itself instead
   of a bash `&`.)
