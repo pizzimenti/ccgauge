@@ -779,14 +779,47 @@ fi
 echo
 echo "ccgauge: verifying"
 
+# Whether the configured status line runs $STATUSLINE_DST as its own first word,
+# with no interpreter in front. That is the only shape where the execute bit
+# decides anything: `bash <path>` reads the file and 0644 runs fine, but a bare
+# `<path>` is exec'd and dies with permission denied. Waiving the bit for every
+# foreign command regardless of form reports a status line that cannot run as
+# "installed and verified" -- the render check skips foreign scripts, so nothing
+# downstream catches it either.
+sl_direct=$(SETTINGS="$SETTINGS" SL="$STATUSLINE_DST" python3 - <<'PY' 2>/dev/null || echo 0
+import json, os, shlex
+cmd = ""
+try:
+    cfg = json.load(open(os.environ["SETTINGS"], encoding="utf-8-sig"))
+    block = cfg.get("statusLine") if isinstance(cfg, dict) else None
+    if isinstance(block, dict):
+        cmd = block.get("command") or ""
+except Exception:
+    cmd = ""
+words = []
+if isinstance(cmd, str) and cmd.strip():
+    try:
+        words = shlex.split(cmd)
+    except ValueError:
+        words = cmd.split()
+sl = os.path.realpath(os.environ["SL"])
+print(1 if words and os.path.isabs(words[0])
+      and os.path.realpath(words[0]) == sl else 0)
+PY
+)
+
 for f in "$USAGE_DST" "$HOOK_DST" "$STATUSLINE_DST"; do
   if [ -x "$f" ]; then ok "present and executable: ${f#"$CONFIG_DIR"/}"
-  elif [ -f "$f" ] && [ "$f" = "$STATUSLINE_DST" ] && ! statusline_is_ours; then
-    # A preserved foreign status line needs no execute bit. Status lines are
-    # registered as `bash <path>`, and 0644 is an ordinary mode for a script
-    # invoked that way — demanding +x on the one file we deliberately refused to
-    # touch turned a correct preservation into a failed install and exit 1.
+  elif [ -f "$f" ] && [ "$f" = "$STATUSLINE_DST" ] && ! statusline_is_ours \
+       && [ "$sl_direct" != "1" ]; then
+    # A preserved foreign status line that nothing exec's directly needs no
+    # execute bit: it is either unregistered, or invoked through an interpreter
+    # where 0644 is an ordinary mode. Demanding +x on the one file we
+    # deliberately refused to touch turned a correct preservation into exit 1.
     ok "present, left alone (your own script): ${f#"$CONFIG_DIR"/}"
+  elif [ -f "$f" ] && [ "$f" = "$STATUSLINE_DST" ] && [ "$sl_direct" = "1" ]; then
+    fail "not executable: $f  (your statusLine runs it directly — chmod +x it,"
+    printf '        or change the command to: bash %s)\n' "$f"
   elif [ -f "$f" ]; then fail "not executable: $f  (chmod +x it)"
   else fail "missing: $f  (re-run ./install.sh without --check)"
   fi
