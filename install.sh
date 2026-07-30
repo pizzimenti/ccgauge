@@ -826,7 +826,13 @@ idx = next((i for i, w in enumerate(words)
             if w and os.path.isabs(w) and os.path.realpath(w) == sl), None)
 
 if idx is None:
-    needs = 0          # the command does not name this file; the bit is moot
+    # Not naming the file as a *word* is not the same as not naming it.
+    # `bash -c 'exec <path>'` keeps the whole script string as one shlex word, so
+    # nothing resolves to the target, yet the shell exec's it and exits 126 at
+    # 0644. Any mention of the path that did not match the proven shape above is
+    # treated as an invocation we do not understand, which means the bit stays
+    # required. Only a command that never mentions the file at all is moot.
+    needs = 1 if (os.environ["SL"] in cmd or sl in cmd) else 0
 elif idx == 0:
     needs = 1          # the file is the command itself -- exec'd, needs +x
 else:
@@ -1160,9 +1166,17 @@ PY
     printf '        Claude Code cannot fire the hook — fix the command in settings.json\n'
   elif [ -n "$hook_script" ] && [ ! -f "$hook_script" ]; then
     fail "hook script does not exist: $hook_script"
+  elif ! "$hook_interp" -c 'pass' > /dev/null 2>&1; then
+    # Resolving a name proves nothing about what it does: `/bin/false <usage.py>
+    # hookline` passes `command -v` and the file check, then produces no hook
+    # output at all. `-c pass` is the cheapest proof that the registered program
+    # is actually a working Python, and it touches neither the network nor
+    # usage.py, so --check keeps its promise.
+    fail "hook interpreter is not a usable Python: $hook_interp"
+    printf '        it resolves, but cannot run `-c pass` — Claude Code gets no hook output\n'
   else
-    ok "hook registered (a direct usage.py call — interpreter and script check out;"
-    printf '        not executed under --check, which makes no network call)\n'
+    ok "hook registered (a direct usage.py call — interpreter runs Python and the"
+    printf '        script exists; not executed under --check, which makes no network call)\n'
   fi
 elif [ "$CHECK_ONLY" -eq 1 ]; then
   # Run the real command, with usage.py stubbed out. "Present, executable and

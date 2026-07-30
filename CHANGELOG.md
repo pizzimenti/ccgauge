@@ -64,8 +64,21 @@ files it used to overwrite it now refuses to touch.
   same TTL, the same 429 back-off and the same non-blocking lock, so the ceiling
   stays one request per `TTL_SECONDS`; the fetch simply moves ahead of the print
   instead of trailing it. The cost is up to `HTTP_TIMEOUT` (6s) of prompt latency
-  on the first prompt after an idle gap. During active back-and-forth the cache
-  stays under the TTL, the gate never fires, and `line` stays instant.
+  on the first prompt after an idle gap, and — because a failed fetch now parks
+  the next attempt (below) — at most once per `TTL_SECONDS` while the endpoint is
+  down, rather than on every turn. During active back-and-forth the cache stays
+  under the TTL, the gate never fires, and `line` stays instant.
+
+- **A failed fetch no longer costs latency on every prompt.** A non-429 failure —
+  endpoint unreachable, DNS down, a timeout — writes no cache, so nothing
+  advanced the TTL clock and the synchronous gate above stayed true. Every
+  prompt then opened another request and blocked on it for up to `HTTP_TIMEOUT`,
+  turning an outage into six seconds of latency per turn. One failure now parks
+  the next attempt a full `TTL_SECONDS` out: the same cadence a *successful*
+  fetch sets, so an outage costs no more attempts than normal operation. It is
+  deliberately not the 429 ladder, which escalates to two hours to let a
+  server-side quota drain — the wrong answer to a dropped Wi-Fi link. `usage.py
+  show` bypasses it, as it already bypasses the TTL.
 
   The status line is unaffected — it reads the cache without refreshing, and
   `STALE_SECONDS` still governs the stale marker and the pace-mark age budget

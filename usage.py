@@ -83,6 +83,7 @@ CACHE = os.path.join(BASE, "usage-cache.json")
 COOLDOWN = os.path.join(BASE, "usage-429-cooldown")
 LOG = os.path.join(BASE, "usage-log.jsonl")
 LOCK = os.path.join(BASE, "usage-refresh.lock")
+ERRBACKOFF = os.path.join(BASE, "usage-error-backoff")
 
 URL = "https://api.anthropic.com/api/oauth/usage"
 BETA = "oauth-2025-04-20"
@@ -98,6 +99,9 @@ BACKOFF_BASE = 600       # first 429 backs off this long (fallback when no Retry
 BACKOFF_CAP = 7200       # ...doubling per consecutive 429, capped here (2h) so the token's usage
                          # bucket can actually drain instead of us re-arming the server-side lockout
 STALE_SECONDS = 1800     # mark the readout as stale (endpoint likely unreachable) past this
+ERROR_BACKOFF = TTL_SECONDS  # after a non-429 fetch failure, wait this long before retrying:
+                         # a failed attempt writes no cache, so without it nothing advances the
+                         # TTL clock and a synchronous caller retries (and blocks) every prompt
 PACE_MAX_AGE = TTL_SECONDS   # drop the pace mark past this; see pace_for()
 FIVE_HOUR_SECS = 5 * 3600    # span of the session window — the denominator for its pace mark
 SEVEN_DAY_SECS = 7 * 86400   # ...and of the weekly window
@@ -325,6 +329,34 @@ def set_cooldown(retry_after=None):
 def clear_cooldown():
     with contextlib.suppress(Exception):
         os.remove(COOLDOWN)
+
+
+# A network failure is not a 429 and must not arm the 429 ladder: that escalates
+# to BACKOFF_CAP (2h) and exists to let a server-side quota drain, which is the
+# wrong response to a dropped Wi-Fi link. But an unreachable endpoint writes no
+# cache, so nothing advances the TTL clock either — and a synchronous caller that
+# gates on that clock will retry on every single prompt, paying HTTP_TIMEOUT each
+# time. One failed attempt therefore parks the next one a full TTL out: the same
+# cadence a successful fetch would have set, so an outage costs no more attempts
+# than normal operation.
+def in_error_backoff():
+    """True if a recent non-429 fetch failure asked us to wait."""
+    try:
+        with open(ERRBACKOFF) as fh:
+            return _now() < float(fh.read().strip())
+    except Exception:
+        return False
+
+
+def set_error_backoff():
+    with contextlib.suppress(Exception):
+        with open(ERRBACKOFF, "w") as fh:
+            fh.write(str(_now() + ERROR_BACKOFF))
+
+
+def clear_error_backoff():
+    with contextlib.suppress(Exception):
+        os.remove(ERRBACKOFF)
 
 
 def _lock_fh(fh, shared=False):
@@ -635,6 +667,9 @@ def _stale_why(reason):
     if reason == "lock_contended":
         return ("another refresh is already in flight (a second session or"
                 " `usage.py show`) — retry next turn")
+    if reason == "error_backoff":
+        return ("endpoint unreachable on the last try — waiting out a short"
+                " back-off before retrying (`usage.py show` retries now)")
     # http_error, or an unexpected/unknown reason: treat as a real failure to
     # reach the endpoint.
     return "endpoint unreachable"
@@ -711,7 +746,8 @@ def refresh(force=False, outcome=None):
     and wrote a new value), "cooldown" (a 429 back-off is active), "no_token" /
     "expiring_token" (credentials unusable — Claude Code rotates them), "429"
     (this call hit a 429 and armed the back-off), "lock_contended" (another
-    refresh holds the lock — the endpoint was never contacted here), or
+    refresh holds the lock — the endpoint was never contacted here),
+    "error_backoff" (a recent non-429 failure parked the next attempt), or
     "http_error" (a genuine non-200/non-429/network failure). Readers use this
     to name a stale cause precisely instead of guessing after the fact, which
     both mislabels lock contention and opens a check-after-refresh TOCTOU race.
@@ -727,6 +763,11 @@ def refresh(force=False, outcome=None):
             return read_cache()
     if in_cooldown():
         _out("cooldown")
+        return read_cache()
+    # `force` (i.e. `show`) bypasses this the same way it bypasses the TTL: the
+    # user asked for a live read and can wait out one timeout.
+    if not force and in_error_backoff():
+        _out("error_backoff")
         return read_cache()
     token, exp_s = load_token()
     if not token:
@@ -751,6 +792,11 @@ def refresh(force=False, outcome=None):
             # whoever won the lock may have just armed the cooldown; re-check
             _out("cooldown")
             return read_cache()
+        if not force and in_error_backoff():
+            # ...and may equally have just armed the error back-off, having hit
+            # the same unreachable endpoint we are about to reach for
+            _out("error_backoff")
+            return read_cache()
         if not force:
             age = cache_age()
             if age is not None and age < TTL_SECONDS:
@@ -773,6 +819,7 @@ def refresh(force=False, outcome=None):
                           five_hour_pct=data.get("five_hour_pct"),
                           seven_day_pct=data.get("seven_day_pct"))
             clear_cooldown()
+            clear_error_backoff()
             _out("ok")
             return data
         if status == 429:
@@ -781,6 +828,11 @@ def refresh(force=False, outcome=None):
                       retry_after=int(retry_after) if retry_after else None)
             _out("429")
             return read_cache()
+        # Park the next attempt. Without this the cache is never written, so the
+        # TTL clock never advances, so a synchronous caller gating on it retries
+        # on every prompt — turning an endpoint outage into HTTP_TIMEOUT of
+        # latency per turn instead of the documented one-off after an idle gap.
+        set_error_backoff()
         _out("http_error")
         return read_cache()
     finally:
