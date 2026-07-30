@@ -786,8 +786,25 @@ echo "ccgauge: verifying"
 # foreign command regardless of form reports a status line that cannot run as
 # "installed and verified" -- the render check skips foreign scripts, so nothing
 # downstream catches it either.
-sl_direct=$(SETTINGS="$SETTINGS" SL="$STATUSLINE_DST" python3 - <<'PY' 2>/dev/null || echo 0
+sl_needs_exec=$(SETTINGS="$SETTINGS" SL="$STATUSLINE_DST" python3 - <<'PY' 2>/dev/null || echo 1
 import json, os, shlex
+
+# Safe by default. An earlier version asked "does this command invoke the file
+# directly?" and waived the execute bit whenever the answer looked like no --
+# which meant every invocation form it had not thought of became a silent pass.
+# `FOO=1 <path>`, `env <path>` and `bash -c '<path>'` all exec the script and die
+# with permission denied at 0644, and none of them puts the path first. Shell
+# invocation forms are not a closed set, so enumerating the dangerous ones is a
+# game you lose by one variant at a time.
+#
+# Inverted: the bit is required unless the command matches the one shape that
+# provably does not need it -- a known interpreter reading the file as an
+# argument. A false failure here says "chmod +x" to someone who did not strictly
+# need it, which is loud and harmless. A false pass reports a status line that
+# cannot run as "installed and verified".
+INTERPRETERS = ("bash", "sh", "zsh", "dash", "ksh", "ash",
+                "python", "python3", "py", "perl", "ruby", "node")
+
 cmd = ""
 try:
     cfg = json.load(open(os.environ["SETTINGS"], encoding="utf-8-sig"))
@@ -796,30 +813,48 @@ try:
         cmd = block.get("command") or ""
 except Exception:
     cmd = ""
+
 words = []
 if isinstance(cmd, str) and cmd.strip():
     try:
         words = shlex.split(cmd)
     except ValueError:
         words = cmd.split()
+
 sl = os.path.realpath(os.environ["SL"])
-print(1 if words and os.path.isabs(words[0])
-      and os.path.realpath(words[0]) == sl else 0)
+idx = next((i for i, w in enumerate(words)
+            if w and os.path.isabs(w) and os.path.realpath(w) == sl), None)
+
+if idx is None:
+    needs = 0          # the command does not name this file; the bit is moot
+elif idx == 0:
+    needs = 1          # the file is the command itself -- exec'd, needs +x
+else:
+    head = os.path.basename(words[0]).lower()
+    head = head[:-4] if head.endswith(".exe") else head
+    between = words[1:idx]
+    # -c takes a *script string*, not a file to read: `bash -c '<path>'` runs the
+    # path as a command and exec's it, so it needs the bit despite looking like
+    # an interpreter invocation.
+    needs = 0 if (head in INTERPRETERS
+                  and all(w.startswith("-") for w in between)
+                  and "-c" not in between) else 1
+print(needs)
 PY
 )
 
 for f in "$USAGE_DST" "$HOOK_DST" "$STATUSLINE_DST"; do
   if [ -x "$f" ]; then ok "present and executable: ${f#"$CONFIG_DIR"/}"
   elif [ -f "$f" ] && [ "$f" = "$STATUSLINE_DST" ] && ! statusline_is_ours \
-       && [ "$sl_direct" != "1" ]; then
-    # A preserved foreign status line that nothing exec's directly needs no
-    # execute bit: it is either unregistered, or invoked through an interpreter
-    # where 0644 is an ordinary mode. Demanding +x on the one file we
-    # deliberately refused to touch turned a correct preservation into exit 1.
+       && [ "$sl_needs_exec" != "1" ]; then
+    # A preserved foreign status line that provably does not need the bit: either
+    # nothing names it, or a known interpreter reads it as an argument, where
+    # 0644 is an ordinary mode. Demanding +x on the one file we deliberately
+    # refused to touch turned a correct preservation into exit 1.
     ok "present, left alone (your own script): ${f#"$CONFIG_DIR"/}"
-  elif [ -f "$f" ] && [ "$f" = "$STATUSLINE_DST" ] && [ "$sl_direct" = "1" ]; then
-    fail "not executable: $f  (your statusLine runs it directly — chmod +x it,"
-    printf '        or change the command to: bash %s)\n' "$f"
+  elif [ -f "$f" ] && [ "$f" = "$STATUSLINE_DST" ] && [ "$sl_needs_exec" = "1" ]; then
+    fail "not executable: $f  (your statusLine command runs it directly —"
+    printf '        chmod +x it, or change the command to: bash %s)\n' "$f"
   elif [ -f "$f" ]; then fail "not executable: $f  (chmod +x it)"
   else fail "missing: $f  (re-run ./install.sh without --check)"
   fi
@@ -1097,9 +1132,38 @@ fi
 if [ -z "$hook_cmd_stored" ]; then
   fail "no hook command in settings.json to exercise"
 elif [ "$CHECK_ONLY" -eq 1 ] && [ "$hook_via_script" -eq 0 ]; then
-  # A direct usage.py invocation ignores CCGAUGE_USAGE_PY, so there is no way to
-  # run it here without the network call --check promises not to make.
-  ok "hook registered (a direct usage.py call — not executed under --check)"
+  # A direct usage.py invocation ignores CCGAUGE_USAGE_PY, so the hook itself
+  # cannot be run here without the network call --check promises not to make.
+  # Its two pieces can still be checked, and the interpreter is the one that
+  # matters: every other check in this script runs usage.py through the
+  # *installer's* python3, never the one the registration names. A registration
+  # like `missing-python <usage.py> hookline` therefore passed everything and
+  # exited 0 while Claude Code could not fire the hook at all.
+  hook_parts=$(HC="$hook_cmd_stored" python3 - <<'PY' 2>/dev/null
+import os, shlex
+c = os.environ.get("HC", "")
+try:
+    w = shlex.split(c)
+except ValueError:
+    w = c.split()
+interp = w[0] if w else ""
+script = next((x for x in w[1:] if x.endswith(".py")), "")
+print(interp + "\x1f" + script)
+PY
+)
+  hook_interp=${hook_parts%%$'\x1f'*}
+  hook_script=${hook_parts#*$'\x1f'}
+  if [ -z "$hook_interp" ]; then
+    fail "could not read the hook command in settings.json to check it"
+  elif ! command -v "$hook_interp" > /dev/null 2>&1; then
+    fail "hook interpreter not found: $hook_interp"
+    printf '        Claude Code cannot fire the hook — fix the command in settings.json\n'
+  elif [ -n "$hook_script" ] && [ ! -f "$hook_script" ]; then
+    fail "hook script does not exist: $hook_script"
+  else
+    ok "hook registered (a direct usage.py call — interpreter and script check out;"
+    printf '        not executed under --check, which makes no network call)\n'
+  fi
 elif [ "$CHECK_ONLY" -eq 1 ]; then
   # Run the real command, with usage.py stubbed out. "Present, executable and
   # registered" proves nothing about whether the shell can actually run the
