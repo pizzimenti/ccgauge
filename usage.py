@@ -816,9 +816,15 @@ def cmd_line():
     # refresh()'s outcome so a still-stale readout can name its real cause
     # rather than re-deriving it afterward (which mislabels lock contention and
     # races token/cooldown state).
+    #
+    # The gate reads cache_age() — the file's mtime — because that is the clock
+    # refresh() throttles on. Gating on the payload's fetched_at instead let the
+    # two disagree: a cache restored from a backup, or copied between machines,
+    # carries an old fetched_at on a new mtime, so every prompt decided a refresh
+    # was due and refresh() then declined it as premature, printing the same
+    # stale numbers this gate exists to prevent. One clock, one decision.
     reason = None
-    prev_fa = c.get("fetched_at") if c else None
-    prev_age = (_now() - prev_fa) if isinstance(prev_fa, (int, float)) else None
+    prev_age = cache_age()
     if prev_age is None or prev_age > TTL_SECONDS:
         outcome = {}
         fresh = refresh(outcome=outcome)

@@ -347,9 +347,23 @@ if [ "$CHECK_ONLY" -eq 0 ]; then
   # the config dir then source and destination are the same file and the `rm`
   # deletes the source before it can be read.
   install_file() {
-    local src="$1" dst="$2" t mode
-    if [ -e "$dst" ] && [ "$(readlink -f "$src" 2>/dev/null)" = "$(readlink -f "$dst" 2>/dev/null)" ]; then
-      chmod +x "$dst" 2>/dev/null || true
+    local src="$1" dst="$2" t mode sres dres
+    # `readlink -f` is GNU; the BSD readlink on older macOS has no -f. With
+    # stderr discarded both substitutions came back empty, compared equal, and
+    # this returned 0 having copied nothing — while the caller went on to print
+    # "copied usage.py, hooks/usage-line.sh, statusline.sh". A silently skipped
+    # install that reports success is the worst failure this script can have, so
+    # the short circuit now requires a non-empty resolution and falls back to
+    # python3, which is already a hard dependency.
+    resolve() {
+      readlink -f "$1" 2>/dev/null \
+        || P="$1" python3 -c 'import os; print(os.path.realpath(os.environ["P"]))' 2>/dev/null
+    }
+    sres=$(resolve "$src"); dres=$(resolve "$dst")
+    if [ -e "$dst" ] && [ -n "$sres" ] && [ "$sres" = "$dres" ]; then
+      # u+x, not +x: a bare +x grants group and other the execute bit too, which
+      # is exactly what the mode-preserving branch below refuses to do.
+      chmod u+x "$dst" 2>/dev/null || true
       return 0                      # already the same file; nothing to do
     fi
     # Severing the link is the deliberate choice (see above), but it must not be
@@ -629,7 +643,18 @@ if current and not (sl is not None and refers_to(current, sl_path)):
     t = script_target(current)
     if t and os.path.isabs(t) and not os.path.exists(t):
         dead_target = t
-was_ours = os.path.basename(dead_target) in ("statusline-snippet.sh", "statusline.sh")
+# Matched on the full path, never the basename alone. `statusline.sh` is a
+# conventional name, and a custom status line can be *temporarily* absent — an
+# unmounted home, a dotfiles checkout not yet cloned. Accepting any missing file
+# with a matching basename let an ordinary `git pull && ./install.sh` repoint
+# someone's own configuration permanently, without --statusline, which is the
+# exact clobbering this release exists to stop. Only the two paths ccgauge itself
+# has ever written qualify as a repair.
+_sl_dir = os.path.dirname(sl_path)
+was_ours = bool(dead_target) and os.path.normpath(dead_target) in (
+    os.path.normpath(os.path.join(_sl_dir, "statusline-snippet.sh")),
+    os.path.normpath(sl_path),
+)
 
 if current and sl is not None and refers_to(current, sl_path) and statusline_installed:
     print(f"  {G}ok{X}    status line already registered")
@@ -645,6 +670,18 @@ elif dead_target and was_ours and statusline_installed:
     changed = True
     print(f"  {G}ok{X}    repointed a ccgauge status line that named the removed "
           f"{os.path.basename(dead_target)}")
+elif not statusline_installed:
+    # The file at sl_path is the user's own script, which the copy step refused to
+    # overwrite. Registering the path anyway would aim Claude Code at their
+    # script and then report it as ccgauge rendering correctly.
+    #
+    # This arm sits above the generic "leaving your existing status line alone"
+    # branch deliberately. When the registration already names sl_path and the
+    # file there is the user's own, both arms match — and the generic one printed
+    # the command back at them as though the path were the point, burying the
+    # thing they actually need to know and the flag that acts on it.
+    print(f"  {Y}warn{X}  not registering a status line: {sl_path} is your own script")
+    print( "          take it over with: ./install.sh --statusline")
 elif current and not take_statusline:
     if dead_target:
         print(f"  {Y}warn{X}  your status line names a file that does not exist:")
@@ -656,12 +693,6 @@ elif current and not take_statusline:
         print(f"          {current}")
         print( "          add ccgauge to it yourself (see the README), or take it over with:")
         print( "              ./install.sh --statusline")
-elif not statusline_installed:
-    # The file at sl_path is the user's own script, which the copy step refused to
-    # overwrite. Registering the path anyway would aim Claude Code at their
-    # script and then report it as ccgauge rendering correctly.
-    print(f"  {Y}warn{X}  not registering a status line: {sl_path} is your own script")
-    print( "          take it over with: ./install.sh --statusline")
 else:
     replacing = current
     # Set only the keys we own, so any sibling key in an existing statusLine
@@ -750,6 +781,12 @@ echo "ccgauge: verifying"
 
 for f in "$USAGE_DST" "$HOOK_DST" "$STATUSLINE_DST"; do
   if [ -x "$f" ]; then ok "present and executable: ${f#"$CONFIG_DIR"/}"
+  elif [ -f "$f" ] && [ "$f" = "$STATUSLINE_DST" ] && ! statusline_is_ours; then
+    # A preserved foreign status line needs no execute bit. Status lines are
+    # registered as `bash <path>`, and 0644 is an ordinary mode for a script
+    # invoked that way — demanding +x on the one file we deliberately refused to
+    # touch turned a correct preservation into a failed install and exit 1.
+    ok "present, left alone (your own script): ${f#"$CONFIG_DIR"/}"
   elif [ -f "$f" ]; then fail "not executable: $f  (chmod +x it)"
   else fail "missing: $f  (re-run ./install.sh without --check)"
   fi
@@ -871,6 +908,10 @@ sl_is_ours_file = os.environ.get("SL_IS_OURS") == "1"
 ours = refers_to(cmd, sl) and isinstance(sl_raw, dict) and sl_is_ours_file
 target = script_target(cmd)
 sl_broken = False
+# A status line the writer deliberately declined to register, because the file at
+# our path belongs to the user. It is neither broken nor missing, and must not be
+# counted as either — see the arm below.
+sl_preserved = False
 if ours:
     print(f"  {G}ok{X}    status line is registered")
 elif cmd and refers_to(cmd, sl) and not sl_is_ours_file:
@@ -887,15 +928,28 @@ elif cmd and target and not os.path.isabs(target):
 elif cmd and target and os.path.isabs(target) and not os.path.exists(target):
     sl_broken = True
     print(f"  {R}FAIL{X}  status line names a file that does not exist: {target}")
-    print( "        it renders nothing every turn — re-run ./install.sh without --check")
+    print( "        it renders nothing every turn. Re-running the installer will not")
+    print( "        repair it — that path is not one ccgauge wrote, so it is left alone")
+    print( "        rather than repointed. Restore the file (an unmounted dotfiles")
+    print( "        checkout is the usual cause), fix the path in settings.json, or")
+    print( "        hand the status line to ccgauge with: ./install.sh --statusline")
 elif cmd:
     print(f"  {Y}warn{X}  status line points elsewhere: {cmd}")
     print( "        (fine if that is deliberate — see the README)")
+elif not sl_is_ours_file and os.path.exists(sl):
+    # Nothing is registered *because* the file at our path is the user's own
+    # script and the writer refused to aim Claude Code at it. That is the
+    # preservation guarantee working, not a broken install — reporting it as
+    # "no status line configured" and exiting 1 turned the correct outcome into
+    # a failure, on every update, for exactly the users the guarantee is for.
+    sl_preserved = True
+    print(f"  {Y}warn{X}  no status line registered: {sl} is your own script")
+    print( "        left alone on purpose — take it over with: ./install.sh --statusline")
 else:
     print(f"  {R}FAIL{X}  no status line configured — the gauges have nowhere to render")
     print( "        re-run ./install.sh without --check")
 
-sys.exit(0 if registered and (ours or cmd) and not sl_broken else 1)
+sys.exit(0 if registered and (ours or cmd or sl_preserved) and not sl_broken else 1)
 PY
 ) && settings_ok=1 || settings_ok=0
 printf '%s\n' "$settings_report"
