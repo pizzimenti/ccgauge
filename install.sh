@@ -45,6 +45,7 @@ done
 PY_PRELUDE='
 import os, shlex
 
+
 def refers_to(cmd, target):
     """Does this command string invoke `target`, however it was quoted?
 
@@ -52,19 +53,44 @@ def refers_to(cmd, target):
     <= 0.7.0 wrote the hook: unquoted. In a config dir containing a space,
     shlex.split shreds that legacy value into words resolving to nothing, so an
     upgrade would not recognise its own previous registration and would append a
-    second one — the duplicate this exists to prevent.
+    second one — the duplicate this exists to prevent. Callers that care whether
+    the stored spelling is the *canonical* one compare against it directly.
+
+    Anything that is not a string is simply not a match. settings.json is
+    hand-editable, so `command` can be a list, a number, or an object, and
+    os.path.realpath raises TypeError on all of them — crashing the writer with
+    a raw traceback after the files have already been copied.
     """
-    cmd = cmd or ""
+    if not isinstance(cmd, str) or not cmd.strip():
+        return False
     rt = os.path.realpath(target)
-    if cmd and os.path.realpath(cmd) == rt:
+    if os.path.realpath(cmd) == rt:
         return True
     try:
         words = shlex.split(cmd)
     except ValueError:
         words = cmd.split()
     return any(os.path.realpath(w) == rt for w in words if w)
+
+
+def dget(obj, key, default=None):
+    """`obj[key]` when obj is a dict, else `default`.
+
+    settings.json is hand-editable and every value in it is untrusted. Chained
+    `(cfg.get("x") or {}).get("y")` reads look safe but raise AttributeError the
+    moment "x" is a string or a list — which is exactly the shape the writer
+    goes out of its way to preserve, so the two halves disagree and a correct
+    install reports itself broken with a traceback.
+    """
+    return obj.get(key, default) if isinstance(obj, dict) else default
 '
 export PY_PRELUDE
+
+# One EXIT trap for the whole script. A second `trap ... EXIT` silently replaces
+# the first rather than adding to it, so anything needing cleanup appends here.
+CLEANUP=""
+# shellcheck disable=SC2064
+trap 'for _f in $CLEANUP; do rm -f "$_f"; done' EXIT
 
 FAILURES=0
 ok()   { printf '  \033[0;32mok\033[0m    %s\n' "$1"; }
@@ -137,27 +163,73 @@ if [ "$CHECK_ONLY" -eq 0 ]; then
   # $CONFIG_DIR/statusline.sh matters most: that name is not ours, it is where
   # Claude Code's own /statusline command writes.
   backup_if_differs() {
-    [ -e "$1" ] || return 0
-    cmp -s "$2" "$1" && return 0
-    b="$1.$(date +%Y%m%d-%H%M%S).bak"
+    local dst="$1" src="$2" b stamp n
+    [ -e "$dst" ] || return 0
+    cmp -s "$src" "$dst" && return 0
+    stamp="$(date +%Y%m%d-%H%M%S)"
+    b="$dst.$stamp.bak"
     n=1
-    while [ -e "$b" ]; do n=$((n + 1)); b="$1.$(date +%Y%m%d-%H%M%S)-$n.bak"; done
-    cp -pL "$1" "$b" 2>/dev/null || cp -p "$1" "$b"
-    warn "existing $(basename "$1") differs — backed it up to $(basename "$b")"
+    while [ -e "$b" ]; do n=$((n + 1)); b="$dst.$stamp-$n.bak"; done
+    # A backup we could not write must stop the install, not be shrugged off:
+    # the very next step overwrites this file, and proceeding would destroy the
+    # only copy. Reported as a FAIL rather than left to `set -e`, which would
+    # abort with a bare `cp:` line, no diagnostic and no summary.
+    if ! { cp -pL "$dst" "$b" 2>/dev/null || cp -p "$dst" "$b" 2>/dev/null; }; then
+      fail "could not back up $dst — refusing to overwrite it"
+      return 1
+    fi
+    warn "existing $(basename "$dst") differs — backed it up to $(basename "$b")"
   }
-  backup_if_differs "$STATUSLINE_DST" "$HERE/statusline.sh"
-  backup_if_differs "$HOOK_DST"       "$HERE/hooks/usage-line.sh"
-  backup_if_differs "$USAGE_DST"      "$HERE/usage.py"
+  backed_up=1
+  backup_if_differs "$STATUSLINE_DST" "$HERE/statusline.sh" || backed_up=0
+  backup_if_differs "$HOOK_DST"       "$HERE/hooks/usage-line.sh" || backed_up=0
+  backup_if_differs "$USAGE_DST"      "$HERE/usage.py" || backed_up=0
+  if [ "$backed_up" -eq 0 ]; then
+    echo
+    printf '\033[0;31mccgauge: nothing was overwritten — see above.\033[0m\n' >&2
+    exit 1
+  fi
 
-  # Remove the destination before copying. `cp` follows a symlink and rewrites
-  # its *target* in place, so installing over a $CONFIG_DIR/statusline.sh that
-  # points into a dotfiles repo would silently overwrite the tracked file there
-  # — the same symlink hazard the settings.json write was hardened against, in
-  # the opposite and more destructive direction.
-  install_file() { rm -f "$2"; cp "$1" "$2"; chmod +x "$2"; }
-  install_file "$HERE/usage.py"           "$USAGE_DST"
-  install_file "$HERE/hooks/usage-line.sh" "$HOOK_DST"
-  install_file "$HERE/statusline.sh"      "$STATUSLINE_DST"
+  # Copy to a sibling temp file, then rename over the destination.
+  #
+  # `mv` replaces the directory entry rather than writing through it, which is
+  # what keeps a symlinked $CONFIG_DIR/statusline.sh from having its target — a
+  # tracked file in someone's dotfiles repo — rewritten in place. But it must
+  # not be preceded by `rm`: removing the destination first means a failing copy
+  # leaves nothing behind, destroying a working install, and if the clone *is*
+  # the config dir then source and destination are the same file and the `rm`
+  # deletes the source before it can be read.
+  install_file() {
+    local src="$1" dst="$2" t
+    if [ -e "$dst" ] && [ "$(readlink -f "$src" 2>/dev/null)" = "$(readlink -f "$dst" 2>/dev/null)" ]; then
+      chmod +x "$dst" 2>/dev/null || true
+      return 0                      # already the same file; nothing to do
+    fi
+    t="$dst.ccgauge-tmp.$$"
+    if ! cp "$src" "$t" 2>/dev/null; then
+      rm -f "$t"
+      fail "could not write $dst (is $CONFIG_DIR writable?)"
+      return 1
+    fi
+    # Guarded: an unguarded chmod would abort the run under `set -e` with no
+    # diagnostic and leave the temp file behind.
+    if ! chmod +x "$t" 2>/dev/null || ! mv -f "$t" "$dst" 2>/dev/null; then
+      rm -f "$t"
+      fail "could not replace $dst"
+      return 1
+    fi
+  }
+  # Sweep any temp file an interrupted run leaves behind (see CLEANUP below).
+  CLEANUP="$CLEANUP $USAGE_DST.ccgauge-tmp.$$ $HOOK_DST.ccgauge-tmp.$$ $STATUSLINE_DST.ccgauge-tmp.$$"
+  copied=1
+  install_file "$HERE/usage.py"            "$USAGE_DST" || copied=0
+  install_file "$HERE/hooks/usage-line.sh" "$HOOK_DST"  || copied=0
+  install_file "$HERE/statusline.sh"       "$STATUSLINE_DST" || copied=0
+  if [ "$copied" -eq 0 ]; then
+    echo
+    printf '\033[0;31mccgauge: could not install the files — see above.\033[0m\n' >&2
+    exit 1
+  fi
   ok "copied usage.py, hooks/usage-line.sh, statusline.sh"
 
   if [ ! -f "$SETTINGS" ]; then
@@ -288,8 +360,25 @@ if len(existing) > 1:
             kept.append(g)
     groups[:] = kept
     existing = [True] if seen else []
+# Recognising a registration is not the same as accepting its spelling. Matching
+# the whole unquoted string stops an upgrade appending a duplicate of itself, but
+# on its own it also means a pre-0.8.0 unquoted path in a config dir containing a
+# space is declared "already registered" and the quoting fix never lands — the
+# hook stays word-split and stays broken. Recognise it, then rewrite it.
+rewrote = 0
+for g in groups:
+    for h in (group_hooks(g) or []):
+        if isinstance(h, dict) and refers_to(h.get("command"), hook_path) \
+                and h.get("command") != hook_cmd:
+            h["command"] = hook_cmd
+            h.setdefault("type", "command")
+            rewrote += 1
+if rewrote:
+    print(f"  {G}ok{X}    rewrote {rewrote} hook registration(s) to the quoted form")
+
 if existing:
-    print(f"  {G}ok{X}    UserPromptSubmit hook already registered")
+    if not rewrote:
+        print(f"  {G}ok{X}    UserPromptSubmit hook already registered")
 else:
     groups.append({"hooks": [{"type": "command", "command": hook_cmd}]})
     print(f"  {G}ok{X}    registered UserPromptSubmit hook")
@@ -446,10 +535,18 @@ hook, sl = os.environ["HOOK_DST"], os.environ["STATUSLINE_DST"]
 exec(os.environ["PY_PRELUDE"])   # refers_to() — single definition, see the top
 
 
-groups = (cfg.get("hooks") or {}).get("UserPromptSubmit") or []
-matches = [h for g in groups if isinstance(g, dict)
-           for h in g.get("hooks", []) if isinstance(h, dict)
-           and refers_to(h.get("command"), hook)]
+# Every read here goes through dget: settings.json is hand-editable, `--check`
+# skips the writer entirely, and an unguarded chained .get() tracebacks on the
+# very shapes the writer preserves — turning a correct install into a false FAIL
+# with a Python stack trace on the terminal.
+groups = dget(dget(cfg, "hooks"), "UserPromptSubmit")
+if not isinstance(groups, list):
+    if groups is not None:
+        print(f"  {Y}warn{X}  hooks.UserPromptSubmit is not a list — cannot read it")
+    groups = []
+matches = [h for g in groups
+           for h in (dget(g, "hooks") if isinstance(dget(g, "hooks"), list) else [])
+           if isinstance(h, dict) and refers_to(h.get("command"), hook)]
 registered = bool(matches)
 if len(matches) > 1:
     print(f"  {Y}warn{X}  hook is registered {len(matches)} times — it will fire "
@@ -458,8 +555,13 @@ if len(matches) > 1:
 print(f"  {G}ok{X}    UserPromptSubmit hook is registered" if registered
       else f"  {R}FAIL{X}  UserPromptSubmit hook is NOT registered")
 
-cmd = (cfg.get("statusLine") or {}).get("command") or ""
-ours = refers_to(cmd, sl)
+sl_raw = cfg.get("statusLine") if isinstance(cfg, dict) else None
+cmd = dget(sl_raw, "command") or ""
+# A statusLine that is not an object is still a configured status line — the
+# writer deliberately leaves it alone, so the verifier must not call it missing.
+if not cmd and sl_raw is not None and not isinstance(sl_raw, dict):
+    cmd = json.dumps(sl_raw)
+ours = refers_to(cmd, sl) and isinstance(sl_raw, dict)
 if ours:
     print(f"  {G}ok{X}    status line is registered")
 elif cmd:
@@ -534,7 +636,7 @@ cmd = (sl.get("command") or "") if isinstance(sl, dict) else ""
 print(cmd if refers_to(cmd, os.environ["TARGET"]) else "")' 2>/dev/null || echo "")
 
 hook_err=$(mktemp); sl_err=$(mktemp)
-trap 'rm -f "$hook_err" "$sl_err"' EXIT
+CLEANUP="$CLEANUP $hook_err $sl_err"
 
 if [ -z "$hook_cmd_stored" ]; then
   fail "no hook command in settings.json to exercise"
