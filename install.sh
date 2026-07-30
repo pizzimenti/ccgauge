@@ -37,6 +37,35 @@ for arg in "$@"; do
   esac
 done
 
+# Shared by every python step below via exec(). Defined once on purpose: this
+# predicate decides both what gets *written* to settings.json and what gets
+# *recognised* there, and an earlier revision that spelled it separately in each
+# place drifted — the writer quoted the path while the verifier compared it raw,
+# so a correct install reported itself broken.
+PY_PRELUDE='
+import os, shlex
+
+def refers_to(cmd, target):
+    """Does this command string invoke `target`, however it was quoted?
+
+    Also matches the whole string against the target, which is how ccgauge
+    <= 0.7.0 wrote the hook: unquoted. In a config dir containing a space,
+    shlex.split shreds that legacy value into words resolving to nothing, so an
+    upgrade would not recognise its own previous registration and would append a
+    second one — the duplicate this exists to prevent.
+    """
+    cmd = cmd or ""
+    rt = os.path.realpath(target)
+    if cmd and os.path.realpath(cmd) == rt:
+        return True
+    try:
+        words = shlex.split(cmd)
+    except ValueError:
+        words = cmd.split()
+    return any(os.path.realpath(w) == rt for w in words if w)
+'
+export PY_PRELUDE
+
 FAILURES=0
 ok()   { printf '  \033[0;32mok\033[0m    %s\n' "$1"; }
 warn() { printf '  \033[0;33mwarn\033[0m  %s\n' "$1"; }
@@ -98,31 +127,57 @@ if [ "$CHECK_ONLY" -eq 0 ]; then
   echo "ccgauge: installing into $CONFIG_DIR"
   mkdir -p "$CONFIG_DIR/hooks"
 
-  # $CONFIG_DIR/statusline.sh is not a name ccgauge owns — Claude Code's own
-  # /statusline command writes there too. Overwriting someone's script with no
-  # copy anywhere is the same data loss the settings.json backups exist to
-  # prevent, so back it up unless it is already ours.
-  if [ -f "$STATUSLINE_DST" ] && ! cmp -s "$HERE/statusline.sh" "$STATUSLINE_DST"; then
-    if ! head -3 "$STATUSLINE_DST" 2>/dev/null | grep -q "ccgauge's status line"; then
-      sl_backup="$STATUSLINE_DST.$(date +%Y%m%d-%H%M%S).bak"
-      n=1
-      while [ -e "$sl_backup" ]; do
-        n=$((n + 1)); sl_backup="$STATUSLINE_DST.$(date +%Y%m%d-%H%M%S)-$n.bak"
-      done
-      cp -p "$STATUSLINE_DST" "$sl_backup"
-      warn "an existing statusline.sh was already here — backed it up to"
-      warn "  $(basename "$sl_backup")"
-    fi
-  fi
+  # Back up anything at a destination that differs from what we are about to
+  # write. No content marker: an earlier version keyed on "does the file contain
+  # ccgauge's header comment", which reads a *customised copy of our own script*
+  # as already-ours and overwrites the customisation with no backup at all — and
+  # the README invites exactly that by calling statusline.sh a working reference.
+  # Differing content is the only honest test.
+  #
+  # $CONFIG_DIR/statusline.sh matters most: that name is not ours, it is where
+  # Claude Code's own /statusline command writes.
+  backup_if_differs() {
+    [ -e "$1" ] || return 0
+    cmp -s "$2" "$1" && return 0
+    b="$1.$(date +%Y%m%d-%H%M%S).bak"
+    n=1
+    while [ -e "$b" ]; do n=$((n + 1)); b="$1.$(date +%Y%m%d-%H%M%S)-$n.bak"; done
+    cp -pL "$1" "$b" 2>/dev/null || cp -p "$1" "$b"
+    warn "existing $(basename "$1") differs — backed it up to $(basename "$b")"
+  }
+  backup_if_differs "$STATUSLINE_DST" "$HERE/statusline.sh"
+  backup_if_differs "$HOOK_DST"       "$HERE/hooks/usage-line.sh"
+  backup_if_differs "$USAGE_DST"      "$HERE/usage.py"
 
-  cp "$HERE/usage.py"           "$USAGE_DST"
-  cp "$HERE/hooks/usage-line.sh" "$HOOK_DST"
-  cp "$HERE/statusline.sh"      "$STATUSLINE_DST"
-  chmod +x "$USAGE_DST" "$HOOK_DST" "$STATUSLINE_DST"
+  # Remove the destination before copying. `cp` follows a symlink and rewrites
+  # its *target* in place, so installing over a $CONFIG_DIR/statusline.sh that
+  # points into a dotfiles repo would silently overwrite the tracked file there
+  # — the same symlink hazard the settings.json write was hardened against, in
+  # the opposite and more destructive direction.
+  install_file() { rm -f "$2"; cp "$1" "$2"; chmod +x "$2"; }
+  install_file "$HERE/usage.py"           "$USAGE_DST"
+  install_file "$HERE/hooks/usage-line.sh" "$HOOK_DST"
+  install_file "$HERE/statusline.sh"      "$STATUSLINE_DST"
   ok "copied usage.py, hooks/usage-line.sh, statusline.sh"
 
   if [ ! -f "$SETTINGS" ]; then
-    printf '{\n  "hooks": {}\n}\n' > "$SETTINGS"
+    # `-f` is false for a dangling symlink too, and the redirect would then fail
+    # under `set -e` with a bare shell error and no failure summary — after the
+    # three files have already been copied, leaving a half-install.
+    if [ -L "$SETTINGS" ]; then
+      fail "settings.json is a symlink to a missing target:"
+      printf '        %s -> %s\n' "$SETTINGS" "$(readlink "$SETTINGS")"
+      printf '        create the target (or remove the link) and re-run.\n'
+      echo
+      printf '\033[0;31mccgauge: settings.json was not modified.\033[0m\n' >&2
+      exit 1
+    fi
+    if ! printf '{\n  "hooks": {}\n}\n' > "$SETTINGS" 2>/dev/null; then
+      fail "could not create $SETTINGS (is $CONFIG_DIR writable?)"
+      echo
+      printf '\033[0;31mccgauge: settings.json was not modified.\033[0m\n' >&2
+      exit 1
+    fi
     ok "created $SETTINGS"
   fi
 
@@ -167,51 +222,72 @@ except Exception as exc:
     # under `set -e` with a raw traceback, before the verification phase that
     # would have explained it.
     print(f"  {R}FAIL{X}  could not read settings.json: {exc}")
-    print( "        fix it, or restore the newest settings.json.*.bak beside it")
+    print(f"        fix it, or restore the newest {path}.*.bak")
     sys.exit(1)
 
 
-def refers_to(cmd, target):
-    """Does this command string invoke `target`, however it was quoted?"""
-    try:
-        words = shlex.split(cmd or "")
-    except ValueError:
-        words = (cmd or "").split()
-    return any(os.path.realpath(w) == os.path.realpath(target)
-               for w in words if w)
+exec(os.environ["PY_PRELUDE"])   # refers_to() — single definition, see the top
 
 
 hooks = cfg.setdefault("hooks", {})
 if not isinstance(hooks, dict):
     print(f"  {R}FAIL{X}  settings.json 'hooks' is not an object")
     sys.exit(1)
+# setdefault returns whatever is already there, so a non-list UserPromptSubmit
+# would sail past the guard above and reach .append() — producing exactly the
+# raw traceback the defensive parsing exists to prevent, after the three files
+# have already been copied.
 groups = hooks.setdefault("UserPromptSubmit", [])
+if not isinstance(groups, list):
+    print(f"  {R}FAIL{X}  settings.json hooks.UserPromptSubmit is not a list")
+    print( "        fix it by hand, or restore a settings.json.*.bak")
+    sys.exit(1)
 
 # Compare by resolved path, not by exact string: a trailing slash or a symlink
 # in CLAUDE_CONFIG_DIR spells the same hook differently and would otherwise
 # append a *second* live registration, firing the hook twice per turn.
-existing = [h for g in groups if isinstance(g, dict)
-            for h in g.get("hooks", []) if isinstance(h, dict)
+def group_hooks(g):
+    """A group's hook list, or None if it is not a list we should touch.
+
+    `hooks` is only iterated when it really is a list. Iterating a string
+    rewrites it as a list of its characters, and a dict as a list of its keys —
+    silently destroying a hand-edited entry and writing the wreckage back as the
+    new truth.
+    """
+    h = g.get("hooks") if isinstance(g, dict) else None
+    return h if isinstance(h, list) else None
+
+
+existing = [h for g in groups
+            for h in (group_hooks(g) or []) if isinstance(h, dict)
             and refers_to(h.get("command"), hook_path)]
 if len(existing) > 1:
     print(f"  {Y}warn{X}  {len(existing)} duplicate hook registrations found — pruning to one")
+    # Keep the FIRST of our registrations rather than deleting them all and
+    # appending a fresh bare group: the existing entry may carry keys we do not
+    # know about (a timeout, whatever Claude Code adds next), and its group may
+    # carry a matcher. Re-creating it drops all of that.
+    seen = False
     kept = []
     for g in groups:
-        if not isinstance(g, dict):
-            kept.append(g)          # not ours to interpret; leave it exactly as-is
+        hs = group_hooks(g)
+        if hs is None:
+            kept.append(g)          # not a shape we understand; leave it be
             continue
-        before = g.get("hooks", [])
-        after = [h for h in before
-                 if not (isinstance(h, dict)
-                         and refers_to(h.get("command"), hook_path))]
+        after = []
+        for h in hs:
+            if isinstance(h, dict) and refers_to(h.get("command"), hook_path):
+                if seen:
+                    continue        # a duplicate; drop this one
+                seen = True
+            after.append(h)
         # Drop a group only if *we* emptied it. A group the user left empty — a
-        # matcher-scoped placeholder, say — is theirs, and a blanket
-        # "delete every group with no hooks" silently deletes it.
-        if after or not before:
+        # matcher-scoped placeholder, say — is theirs.
+        if after or not hs:
             g["hooks"] = after
             kept.append(g)
     groups[:] = kept
-    existing = []
+    existing = [True] if seen else []
 if existing:
     print(f"  {G}ok{X}    UserPromptSubmit hook already registered")
 else:
@@ -222,10 +298,15 @@ else:
 # user explicitly asked. Replacing a foreign one by default means the documented
 # "keep your own" setup cannot survive the documented `git pull && ./install.sh`
 # update — every update would silently clobber it again.
-sl = cfg.get("statusLine")
-sl = sl if isinstance(sl, dict) else None
+sl_raw = cfg.get("statusLine")
+sl = sl_raw if isinstance(sl_raw, dict) else None
 current = (sl or {}).get("command")
-if current and refers_to(current, sl_path):
+if sl_raw is not None and sl is None:
+    # A statusLine that is not an object is still the user's configuration.
+    # Coercing it to None makes the "leave a foreign one alone" branch
+    # unreachable and replaces it with no warning and no --statusline.
+    current = json.dumps(sl_raw)
+if current and sl is not None and refers_to(current, sl_path):
     print(f"  {G}ok{X}    status line already registered")
 elif current and not take_statusline:
     print(f"  {Y}warn{X}  leaving your existing status line alone:")
@@ -262,11 +343,14 @@ try:
 except Exception as exc:
     print(f"  {R}FAIL{X}  could not write a backup ({exc}) — refusing to modify settings.json")
     sys.exit(1)
-print(f"  {G}ok{X}    backed up settings.json -> {os.path.basename(backup)}")
+# Print the full path, not just the basename. `path` was realpath'd, so when
+# settings.json is a symlink the backup lands beside the *target* — a message
+# saying "beside it" would point at a directory that has no backup in it.
+print(f"  {G}ok{X}    backed up settings.json -> {backup}")
 if 'replacing' in dir() and replacing:
     print(f"  {Y}warn{X}  replaced your existing status line:")
     print(f"          {replacing}")
-    print(f"          restore it from {os.path.basename(backup)}")
+    print(f"          restore it from {backup}")
 
 # Write via a temp file in the same directory, then rename: an interrupted write
 # must not leave a truncated settings.json, which Claude Code would refuse.
@@ -359,19 +443,7 @@ print(f"  {G}ok{X}    settings.json is valid JSON")
 hook, sl = os.environ["HOOK_DST"], os.environ["STATUSLINE_DST"]
 
 
-def refers_to(cmd, target):
-    """Does this command string invoke `target`, however it was quoted?
-
-    Both commands are shell strings and both are shlex.quote'd on the way in, so
-    an exact string comparison against the bare path fails the moment the config
-    dir contains a space — which is exactly when getting this right matters.
-    """
-    try:
-        words = shlex.split(cmd or "")
-    except ValueError:
-        words = (cmd or "").split()
-    return any(os.path.realpath(w) == os.path.realpath(target)
-               for w in words if w)
+exec(os.environ["PY_PRELUDE"])   # refers_to() — single definition, see the top
 
 
 groups = (cfg.get("hooks") or {}).get("UserPromptSubmit") or []
@@ -440,15 +512,12 @@ print(json.dumps({"workspace": {"current_dir": os.environ["PWD_VAL"]},
 # just deliberately preserved and fails it for not drawing our glyphs. Both
 # declare a correct install broken.
 hook_cmd_stored=$(SETTINGS="$SETTINGS" TARGET="$HOOK_DST" python3 -c '
-import json, os, shlex
-def refers_to(cmd, target):
-    try:
-        words = shlex.split(cmd or "")
-    except ValueError:
-        words = (cmd or "").split()
-    return any(os.path.realpath(w) == os.path.realpath(target) for w in words if w)
+import json, os
+exec(os.environ["PY_PRELUDE"])
 cfg = json.load(open(os.environ["SETTINGS"]))
 groups = (cfg.get("hooks") or {}).get("UserPromptSubmit") or []
+if not isinstance(groups, list):
+    groups = []
 target = os.environ["TARGET"]
 print(next((h.get("command", "") for g in groups if isinstance(g, dict)
             for h in g.get("hooks", []) if isinstance(h, dict)
@@ -457,15 +526,11 @@ print(next((h.get("command", "") for g in groups if isinstance(g, dict)
 # Empty unless the configured status line is ours; a preserved foreign one is
 # reported as skipped rather than executed and judged by our criteria.
 sl_cmd_stored=$(SETTINGS="$SETTINGS" TARGET="$STATUSLINE_DST" python3 -c '
-import json, os, shlex
-def refers_to(cmd, target):
-    try:
-        words = shlex.split(cmd or "")
-    except ValueError:
-        words = (cmd or "").split()
-    return any(os.path.realpath(w) == os.path.realpath(target) for w in words if w)
+import json, os
+exec(os.environ["PY_PRELUDE"])
 cfg = json.load(open(os.environ["SETTINGS"]))
-cmd = ((cfg.get("statusLine") or {}).get("command")) or ""
+sl = cfg.get("statusLine")
+cmd = (sl.get("command") or "") if isinstance(sl, dict) else ""
 print(cmd if refers_to(cmd, os.environ["TARGET"]) else "")' 2>/dev/null || echo "")
 
 hook_err=$(mktemp); sl_err=$(mktemp)
@@ -510,12 +575,23 @@ elif ! sl_out=$(printf '%s' "$SAMPLE" | env -u CCGAUGE_USAGE_PY sh -c "$sl_cmd_s
 elif printf '%s' "$sl_out" | sed 's/\x1b\[[0-9;]*m//g' | grep -qE '(5h|7d) \['; then
   ok "status line renders the usage gauges"
   printf '        %s\n' "$(printf '%b' "$sl_out" | tail -1)"
-elif [ ! -f "$CONFIG_DIR/usage-cache.json" ]; then
-  # No cache yet means the gauges are *correctly* absent, not broken.
-  warn "status line runs, but there is no usage cache yet to render"
+elif ! python3 -c '
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(1)                                     # absent or unreadable
+sys.exit(0 if isinstance(d, dict) and (d.get("five_hour_pct") is not None
+                                       or d.get("seven_day_pct") is not None)
+         else 1)' "$CONFIG_DIR/usage-cache.json" 2>/dev/null; then
+  # Ask whether the cache holds *renderable data*, not merely whether the file
+  # exists. Existence is the wrong proxy: an empty or truncated cache turns a
+  # perfectly healthy install into a hard FAIL, because the gauges are correctly
+  # absent and the check reads that as breakage.
+  warn "status line runs, but there is no usable usage data cached yet"
   warn "re-check after a turn or two with: ./install.sh --check"
 else
-  fail "status line ran but drew no 5h/7d gauge despite a cache being present"
+  fail "status line ran but drew no 5h/7d gauge despite usable cached data"
   printf '        %s\n' "$(printf '%b' "$sl_out" | tail -1)"
 fi
 

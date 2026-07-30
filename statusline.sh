@@ -17,7 +17,12 @@
 input=$(cat)
 
 CONFIG_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+# Same fallback shape as hooks/usage-line.sh: a stale CCGAUGE_USAGE_PY left in
+# the environment must not be fatal at render time, especially since install.sh
+# strips the variable when verifying and so would never see the breakage.
 USAGE_PY="${CCGAUGE_USAGE_PY:-$CONFIG_DIR/usage.py}"
+[ -f "$USAGE_PY" ] || USAGE_PY="$CONFIG_DIR/usage.py"
+[ -f "$USAGE_PY" ] || USAGE_PY="$HOME/.claude/usage.py"
 
 # --- parse the status JSON (cwd / model / context-used%) --------------------
 parsed=$(printf '%s' "$input" | python3 -c '
@@ -26,8 +31,12 @@ try:
     d = json.load(sys.stdin)
 except Exception:
     d = {}
-cwd = (d.get("workspace") or {}).get("current_dir") or d.get("cwd") or ""
-model = (d.get("model") or {}).get("display_name") or ""
+# Newlines are flattened before the record is emitted: the shell consumes this
+# with `read`, which stops at the first one, so a newline anywhere in cwd or the
+# model name would truncate the record and silently drop every later field.
+flat = lambda s: " ".join(str(s).split()) if s else ""
+cwd = flat((d.get("workspace") or {}).get("current_dir") or d.get("cwd") or "")
+model = flat((d.get("model") or {}).get("display_name") or "")
 # Round to a whole percent here rather than in the shell. bash printf parses
 # floats through the *ambient* locale, and prefixing LC_NUMERIC=C does not
 # reach the builtin — in any comma-decimal locale (de_DE, fr_FR, ...) it stops
@@ -36,8 +45,12 @@ model = (d.get("model") or {}).get("display_name") or ""
 # is already a hard dependency and is locale-independent here.
 ctx = (d.get("context_window") or {}).get("used_percentage")
 try:
+    # Broad except on purpose: round() on a float large enough to overflow int
+    # raises OverflowError, which is neither TypeError nor ValueError — and
+    # because this runs before the single write below, an escape here loses the
+    # *whole* record, taking cwd, branch and model down with the percentage.
     ctx = str(max(0, min(100, round(float(ctx)))))
-except (TypeError, ValueError):
+except Exception:
     ctx = ""
 sys.stdout.write("\x1f".join([cwd, model, ctx]))
 ' 2>/dev/null)
