@@ -88,9 +88,15 @@ export PY_PRELUDE
 
 # One EXIT trap for the whole script. A second `trap ... EXIT` silently replaces
 # the first rather than adding to it, so anything needing cleanup appends here.
-CLEANUP=""
-# shellcheck disable=SC2064
-trap 'for _f in $CLEANUP; do rm -f "$_f"; done' EXIT
+#
+# An array, not a string. Iterating an unquoted string splits on whitespace, and
+# CLAUDE_CONFIG_DIR containing a space is a case this installer explicitly
+# supports — so the paths queued here contain spaces, and the split fragments
+# would be passed to `rm -f`, deleting something that was never queued. The
+# length guard keeps `set -u` happy on bash < 4.4, where expanding an empty
+# array is an unbound-variable error.
+CLEANUP=()
+trap '[ ${#CLEANUP[@]} -eq 0 ] || rm -f "${CLEANUP[@]}"' EXIT
 
 FAILURES=0
 ok()   { printf '  \033[0;32mok\033[0m    %s\n' "$1"; }
@@ -219,8 +225,8 @@ if [ "$CHECK_ONLY" -eq 0 ]; then
       return 1
     fi
   }
-  # Sweep any temp file an interrupted run leaves behind (see CLEANUP below).
-  CLEANUP="$CLEANUP $USAGE_DST.ccgauge-tmp.$$ $HOOK_DST.ccgauge-tmp.$$ $STATUSLINE_DST.ccgauge-tmp.$$"
+  # Sweep any temp file an interrupted run leaves behind (see CLEANUP above).
+  CLEANUP+=("$USAGE_DST.ccgauge-tmp.$$" "$HOOK_DST.ccgauge-tmp.$$" "$STATUSLINE_DST.ccgauge-tmp.$$")
   copied=1
   install_file "$HERE/usage.py"            "$USAGE_DST" || copied=0
   install_file "$HERE/hooks/usage-line.sh" "$HOOK_DST"  || copied=0
@@ -617,13 +623,25 @@ hook_cmd_stored=$(SETTINGS="$SETTINGS" TARGET="$HOOK_DST" python3 -c '
 import json, os
 exec(os.environ["PY_PRELUDE"])
 cfg = json.load(open(os.environ["SETTINGS"]))
-groups = (cfg.get("hooks") or {}).get("UserPromptSubmit") or []
-if not isinstance(groups, list):
-    groups = []
+groups = dget(dget(cfg, "hooks"), "UserPromptSubmit")
 target = os.environ["TARGET"]
-print(next((h.get("command", "") for g in groups if isinstance(g, dict)
-            for h in g.get("hooks", []) if isinstance(h, dict)
-            and refers_to(h.get("command"), target)), ""))' 2>/dev/null || echo "")
+found = ""
+# Every level type-guarded, and `hooks` iterated only when it is really a list.
+# Without that guard a malformed sibling group — {"hooks": 5} — raises TypeError,
+# the 2>/dev/null swallows it, and the empty result is reported as "no hook
+# command to exercise": a correct install failing on someone else'"'"'s bad entry.
+if isinstance(groups, list):
+    for g in groups:
+        hs = dget(g, "hooks")
+        if not isinstance(hs, list):
+            continue
+        for h in hs:
+            if isinstance(h, dict) and refers_to(h.get("command"), target):
+                found = h.get("command", "")
+                break
+        if found:
+            break
+print(found)' 2>/dev/null || echo "")
 
 # Empty unless the configured status line is ours; a preserved foreign one is
 # reported as skipped rather than executed and judged by our criteria.
@@ -636,7 +654,7 @@ cmd = (sl.get("command") or "") if isinstance(sl, dict) else ""
 print(cmd if refers_to(cmd, os.environ["TARGET"]) else "")' 2>/dev/null || echo "")
 
 hook_err=$(mktemp); sl_err=$(mktemp)
-CLEANUP="$CLEANUP $hook_err $sl_err"
+CLEANUP+=("$hook_err" "$sl_err")
 
 if [ -z "$hook_cmd_stored" ]; then
   fail "no hook command in settings.json to exercise"
