@@ -4,6 +4,74 @@ All notable changes to ccgauge are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); this project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.9.0] — 2026-07-30
+
+Makes `./install.sh` a complete install on POSIX rather than half of one, and
+gives it a verification pass that fails loudly. The Windows path added in 0.8.0
+is unaffected — `install.ps1` remains the installer there.
+
+### Changed
+
+- **`./install.sh` now installs the whole thing, not half of it.** It also
+  copies a complete status line (`statusline.sh`) and registers it in
+  `settings.json` alongside the `UserPromptSubmit` hook. Previously the
+  installer set up only the hook and left the status line — the part you
+  actually look at — as a manual step against an example file, so a fresh
+  machine needed hand-editing before the gauges appeared anywhere. `git clone
+  && ./install.sh` is now the entire install, and `git pull && ./install.sh`
+  the entire update.
+- **The installer verifies its own work and fails loudly.** It checks that the
+  files are present and executable, that `usage.py` runs, that every mode exits
+  cleanly, that `settings.json` is still valid JSON with both entries
+  registered, and that the hook and status line each render real output —
+  exiting non-zero with a specific message and a command to reproduce the
+  problem. Credentials and endpoint reachability are warnings rather than
+  failures, since neither a container nor a logged-out CLI is a broken install.
+
+  This exists because `usage.py` deliberately swallows its own errors so it can
+  never disrupt a hook or a status line. The cost of that guarantee is that a
+  half-finished install presents as a *blank gauge* rather than a complaint;
+  the installer is the one place allowed to be loud about it.
+- **`./install.sh --check`** re-runs the verification against an existing
+  install without changing anything.
+- **An existing `statusLine` is left alone.** The installer reports what it
+  found and tells you how to add ccgauge to it, or to hand it over with
+  `./install.sh --statusline`. Replacing it by default would have meant the
+  documented "keep your own" setup could not survive the documented `git pull
+  && ./install.sh` update — every update would silently clobber it again.
+  Registration also now sets only the two keys it owns, so sibling keys in an
+  existing `statusLine` block survive.
+- **`--check` reaches the network no more than `git status` does.** It skips
+  the forced refresh and does not execute the hook (which detaches a background
+  refresh of its own), reporting cache age instead. It has to stay safe to run
+  repeatedly while diagnosing a rate-limit problem — firing a request to
+  diagnose a lockout is how you extend one.
+- **Backups of `settings.json` are timestamped and written only when something
+  actually changes.** A single fixed `settings.json.bak` rewritten on every run
+  is a trap: install, notice your status line changed, re-run the installer
+  while working out how to undo it, and the second run's backup — now identical
+  to the modified file — has destroyed the only copy of your original. Nothing
+  now overwrites an existing backup, and a no-op run writes none at all.
+
+- **The installer reports what platform you are on, and refuses macOS.** Claude
+  Code stores its OAuth token in the macOS Keychain rather than in
+  `~/.claude/.credentials.json`, so there is no file for ccgauge to read and no
+  amount of logging in will create one. It now fails outright there with that
+  explanation, instead of installing cleanly and leaving a permanently blank
+  gauge behind a warning that told you to re-authenticate — advice that could
+  never have helped. Windows (Git Bash) installs with a warning that Git for
+  Windows is required, since Claude Code falls back to PowerShell without it and
+  these are bash scripts. Linux is unchanged. On macOS it exits *before* copying
+  or registering anything, rather than installing a gauge that can never
+  populate and only then reporting the platform unsupported.
+
+### Removed
+
+- **`statusline-snippet.sh`**, superseded by `statusline.sh`. It was a toy
+  example that existed only because the installer would not configure a status
+  line itself; shipping both a real one and an example invited exactly the
+  confusion of not knowing which one was live.
+
 ## [0.8.1] — 2026-07-29
 
 Fixes from an adversarial three-lens review of 0.8.0 (Windows/CRT semantics,

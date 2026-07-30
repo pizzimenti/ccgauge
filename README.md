@@ -32,7 +32,15 @@ you see it without asking, and the assistant can proactively flag it.
 
 Requires Python 3.7+ (standard library only — no `pip install`, no `jq`).
 
-### Linux / macOS
+### Platform support
+
+| | |
+| :-- | :-- |
+| **Linux** | Supported and developed on. Use `install.sh`. |
+| **Windows 11** | Supported natively. Use `install.ps1` — see below. |
+| **macOS** | **Not supported.** Claude Code stores its OAuth token in the macOS Keychain rather than in `~/.claude/.credentials.json` ([docs](https://code.claude.com/docs/en/authentication)), so there is no file for ccgauge to read and no amount of logging in will create one. Reading the Keychain isn't implemented, so `install.sh` refuses to run there rather than leaving a gauge that can never populate. |
+
+### Linux
 
 ```sh
 git clone https://github.com/pizzimenti/ccgauge ~/Code/ccgauge
@@ -40,17 +48,75 @@ cd ~/Code/ccgauge
 ./install.sh
 ```
 
-The installer copies `usage.py` and `hooks/usage-line.sh` into your Claude
-config dir (`~/.claude`, or `$CLAUDE_CONFIG_DIR`), and registers the
-`UserPromptSubmit` hook in `settings.json` (idempotently, with a `.bak`
-backup). Then:
+That's the whole install. Restart Claude Code (or start a new session) and both
+halves are live.
 
-1. **Verify:** `python3 ~/.claude/usage.py show`
-2. **Status line:** append the usage fragment to your status line — see
-   [`statusline-snippet.sh`](./statusline-snippet.sh). The one call you add,
-   `python3 ~/.claude/usage.py status`, only reads the cache, so it is safe to
-   run on every render.
-3. **Restart** Claude Code (or start a new session) so the hook loads.
+#### What it installs
+
+The installer copies three files into your Claude config dir (`~/.claude`, or
+`$CLAUDE_CONFIG_DIR`) and registers both of them in `settings.json`,
+idempotently and with a timestamped backup:
+
+| | |
+| :-- | :-- |
+| `usage.py` | the probe and renderer |
+| `hooks/usage-line.sh` | the `UserPromptSubmit` hook — puts usage in the assistant's context |
+| `statusline.sh` | the status line — puts the gauges on your screen |
+
+**Then it proves the install works**, and exits non-zero with a specific message
+if any part of it doesn't: that the files are present and executable, that
+`usage.py` runs, that every one of its modes exits cleanly, that `settings.json`
+is still valid JSON with both entries registered, and that the hook and status
+line each render real output. Only credentials and network reachability are
+treated as warnings, since neither a container nor a logged-out CLI is a broken
+install.
+
+That verification is the point. `usage.py` deliberately swallows its own errors
+so it can never disrupt a hook or a status line, which means a half-finished
+install shows up as a *blank gauge* rather than a complaint. The installer is
+the one place allowed to be loud.
+
+```sh
+git pull && ./install.sh    # update — same command
+./install.sh --check        # verify; makes no network call and mutates nothing
+./install.sh --statusline   # take over a status line you already have
+```
+
+`--check` is safe to run repeatedly, including while you're diagnosing a
+rate-limit problem: it skips the two things that would reach the endpoint (the
+forced refresh, and executing the hook — which detaches a background refresh of
+its own), and reports cache age instead. Firing a request to diagnose a lockout
+is how you extend one.
+
+#### If you already have a status line
+
+**The installer leaves it alone.** It tells you what it found and stops there,
+because replacing it by default would mean the documented "keep your own" setup
+couldn't survive the documented `git pull && ./install.sh` update — every update
+would silently clobber it again.
+
+Add ccgauge to your own status line with one call:
+
+```sh
+python3 "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/usage.py" status
+```
+
+That call only reads ccgauge's cache — no network — so it is safe to run on
+every render. Use `status plain` instead if you want to colour the fragment
+yourself; it emits no ANSI at all. Either way,
+[`statusline.sh`](./statusline.sh) is a working reference.
+
+There are two complete status lines in the repo, for two different reasons.
+`statusline.sh` is the POSIX one this installer wires up: a shell script, so it
+can pick up the git branch without a second process. `usage.py statusline` is
+the Windows one, rendering the same information in a single Python process
+because Windows has no bash to rely on. Use whichever matches your platform;
+`install.sh` and `install.ps1` each pick the right one for you.
+
+Or hand yours over with `./install.sh --statusline`, which backs up the previous
+`settings.json` to a timestamped file first. Backups are only written on a run
+that actually changes something, so nothing ever overwrites an earlier one and a
+repeat run leaves no litter — you can always get back to what you had.
 
 ### Windows 11
 
