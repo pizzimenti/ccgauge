@@ -83,6 +83,71 @@ def _words(cmd):
         return cmd.split()
 
 
+ENV_VALUE_OPTS = ("-u", "--unset", "-C", "--chdir")
+ENV_SPLIT_OPTS = ("-S", "--split-string")
+
+
+def _env_assignment(tok):
+    return ("=" in tok and not tok.startswith("-")
+            and not tok.startswith("/") and not tok.startswith("."))
+
+
+def _prog_base(tok):
+    b = os.path.basename(tok).lower()
+    return b[:-4] if b.endswith(".exe") else b
+
+
+def effective_argv(cmd, _depth=0):
+    """The tokens a shell would actually run, with env prefixes resolved.
+
+    `VAR=1 python3 x.py`, `env python3 x.py` and `env -S "python3 x.py"` all run
+    python3, and argv[0] means nothing until those are stripped. Two checks need
+    this — which program the hook invokes, and whether the status line is exec-ed
+    or read by an interpreter — and each grew its own parser: one skipped `-S` as
+    though it were a value (landing on the script), the other never learned about
+    `env` at all (failing a status line that works). One resolver, both callers.
+
+    `-u NAME`/`-C DIR` take a value to step over. `-S STRING` does not: GNU env
+    splits STRING into the command itself, so it is re-parsed and spliced in.
+    """
+    w = _words(cmd) if isinstance(cmd, str) else list(cmd or [])
+    if _depth > 4:                    # a pathological -S chain; stop unwinding
+        return w
+    i = 0
+    while i < len(w):
+        if _env_assignment(w[i]):
+            i += 1
+            continue
+        if _prog_base(w[i]) == "env":
+            i += 1
+            while i < len(w):
+                t = w[i]
+                if t == "--":
+                    i += 1
+                    break
+                if _env_assignment(t):
+                    i += 1
+                    continue
+                if not t.startswith("-"):
+                    break
+                if t in ENV_SPLIT_OPTS and i + 1 < len(w):
+                    return effective_argv(w[i + 1], _depth + 1) + w[i + 2:]
+                inline = ""
+                if t.startswith("--split-string="):
+                    inline = t[len("--split-string="):]
+                elif t.startswith("-S") and len(t) > 2:
+                    inline = t[2:]
+                if inline:
+                    return effective_argv(inline, _depth + 1) + w[i + 1:]
+                i += 1
+                if t in ENV_VALUE_OPTS and i < len(w):
+                    i += 1
+                continue
+            continue
+        break
+    return w[i:]
+
+
 def _resolves_to(word, rt):
     """Does this single word name `rt` (already resolved)?
 
@@ -801,6 +866,7 @@ echo "ccgauge: verifying"
 # downstream catches it either.
 sl_needs_exec=$(SETTINGS="$SETTINGS" SL="$STATUSLINE_DST" python3 - <<'PY' 2>/dev/null || echo 1
 import json, os, shlex
+exec(os.environ["PY_PRELUDE"])   # effective_argv() — single definition, see the top
 
 # Safe by default. An earlier version asked "does this command invoke the file
 # directly?" and waived the execute bit whenever the answer looked like no --
@@ -835,12 +901,12 @@ try:
 except Exception:
     cmd = ""
 
-words = []
-if isinstance(cmd, str) and cmd.strip():
-    try:
-        words = shlex.split(cmd)
-    except ValueError:
-        words = cmd.split()
+# Resolved through the same routine the hook check uses. This block had its own
+# splitter and never learned about env at all, so `env bash <path>` -- which
+# reads the file and needs no execute bit -- saw words[0] == "env", matched no
+# interpreter, and failed a status line that works. `env <path>` still requires
+# the bit, because after resolution the path *is* argv[0].
+words = effective_argv(cmd) if isinstance(cmd, str) else []
 
 sl = os.path.realpath(os.environ["SL"])
 idx = next((i for i, w in enumerate(words)
@@ -1168,11 +1234,7 @@ elif [ "$CHECK_ONLY" -eq 1 ] && [ "$hook_via_script" -eq 0 ]; then
   # exited 0 while Claude Code could not fire the hook at all.
   hook_parts=$(HC="$hook_cmd_stored" python3 - <<'PY' 2>/dev/null
 import os, shlex
-c = os.environ.get("HC", "")
-try:
-    w = shlex.split(c)
-except ValueError:
-    w = c.split()
+exec(os.environ["PY_PRELUDE"])   # effective_argv() — single definition, see the top
 
 # Report the program this command actually invokes. Position and recognition are
 # both required and neither is sufficient, which took two wrong turns to see:
@@ -1184,54 +1246,14 @@ except ValueError:
 #     different program. The probe then passes while Claude runs printf and gets
 #     no hook output at all.
 #
-# So: walk the prefix forms to the invoked position, and let the caller insist
+# So: resolve the prefixes to the invoked position, and let the caller insist
 # that what we land on is a Python before it runs anything. Landing on something
 # unrecognised is reported, never executed -- `-c` is inert only for programs
 # that read it the way Python does (`shutdown -c` cancels a shutdown), and
 # settings.json is hand-edited and not ours.
-#
-# The env grammar has to include its argument-taking options: an earlier attempt
-# consumed `-u` but not the NAME after it, landed on NAME, and reported the
-# interpreter as "FOO" for a hook that fires perfectly well.
-ENV_ARG_OPTS = ("-u", "--unset", "-C", "--chdir", "-S", "--split-string")
-
-
-def _assignment(tok):
-    return ("=" in tok and not tok.startswith("-")
-            and not tok.startswith("/") and not tok.startswith("."))
-
-
-def _base(tok):
-    b = os.path.basename(tok).lower()
-    return b[:-4] if b.endswith(".exe") else b
-
-
-i = 0
-while i < len(w):
-    if _assignment(w[i]):
-        i += 1
-        continue
-    if _base(w[i]) == "env":
-        i += 1
-        while i < len(w):
-            t = w[i]
-            if t == "--":
-                i += 1
-                break
-            if _assignment(t):
-                i += 1
-                continue
-            if t.startswith("-"):
-                i += 1
-                if t in ENV_ARG_OPTS and i < len(w):
-                    i += 1          # this option takes a separate argument
-                continue
-            break
-        continue
-    break
-
-prog = w[i] if i < len(w) else ""
-script = next((x for x in w[i:] if x.endswith(".py")), "")
+w = effective_argv(os.environ.get("HC", ""))
+prog = w[0] if w else ""
+script = next((x for x in w if x.endswith(".py")), "")
 print(prog + "\x1f" + script)
 PY
 )
