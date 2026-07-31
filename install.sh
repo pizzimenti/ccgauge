@@ -1174,39 +1174,82 @@ try:
 except ValueError:
     w = c.split()
 
-# Find the interpreter by *recognising* it, not by walking to its position.
-# `PYTHONUTF8=1 python3 <usage.py> hookline` and `env -u FOO python3 <usage.py>
-# hookline` are both working registrations, and reaching the program positionally
-# means re-implementing shell prefix grammar. `env -u NAME` alone was enough to
-# defeat an attempt at that: -u takes an argument, so the walk stopped on NAME
-# and reported the interpreter as "FOO" for a hook that fires perfectly well.
+# Report the program this command actually invokes. Position and recognition are
+# both required and neither is sufficient, which took two wrong turns to see:
 #
-# Scanning for the python-looking token has no grammar to get wrong, and it is
-# also the whole of the safety rule -- verification executes the interpreter to
-# prove it works, and `-c` is inert only for programs that read it the way Python
-# does (`shutdown -c` cancels a shutdown). Recognising by name means the verifier
-# can only ever run something it identified, never whatever occupies a position
-# in a file the user hand-edits.
-def _py(tok):
-    b = os.path.basename(tok).lower()
-    if b.endswith(".exe"):
-        b = b[:-4]
-    return (b in ("python", "python2", "python3", "py", "pypy", "pypy3",
-                  "pythonw")
-            or b.startswith("python3."))
+#   * Position alone (words[0]) failed working registrations that carry a shell
+#     prefix -- `PYTHONUTF8=1 python3 <usage.py> hookline`, `env python3 ...`.
+#   * Recognition alone -- scan for any python-looking token -- accepts
+#     `printf python3 <usage.py> hookline`, where python3 is an *argument* to a
+#     different program. The probe then passes while Claude runs printf and gets
+#     no hook output at all.
+#
+# So: walk the prefix forms to the invoked position, and let the caller insist
+# that what we land on is a Python before it runs anything. Landing on something
+# unrecognised is reported, never executed -- `-c` is inert only for programs
+# that read it the way Python does (`shutdown -c` cancels a shutdown), and
+# settings.json is hand-edited and not ours.
+#
+# The env grammar has to include its argument-taking options: an earlier attempt
+# consumed `-u` but not the NAME after it, landed on NAME, and reported the
+# interpreter as "FOO" for a hook that fires perfectly well.
+ENV_ARG_OPTS = ("-u", "--unset", "-C", "--chdir", "-S", "--split-string")
 
-interp = next((x for x in w if _py(x)), "")
-script = next((x for x in w if x.endswith(".py")), "")
-print(interp + "\x1f" + script)
+
+def _assignment(tok):
+    return ("=" in tok and not tok.startswith("-")
+            and not tok.startswith("/") and not tok.startswith("."))
+
+
+def _base(tok):
+    b = os.path.basename(tok).lower()
+    return b[:-4] if b.endswith(".exe") else b
+
+
+i = 0
+while i < len(w):
+    if _assignment(w[i]):
+        i += 1
+        continue
+    if _base(w[i]) == "env":
+        i += 1
+        while i < len(w):
+            t = w[i]
+            if t == "--":
+                i += 1
+                break
+            if _assignment(t):
+                i += 1
+                continue
+            if t.startswith("-"):
+                i += 1
+                if t in ENV_ARG_OPTS and i < len(w):
+                    i += 1          # this option takes a separate argument
+                continue
+            break
+        continue
+    break
+
+prog = w[i] if i < len(w) else ""
+script = next((x for x in w[i:] if x.endswith(".py")), "")
+print(prog + "\x1f" + script)
 PY
 )
   hook_interp=${hook_parts%%$'\x1f'*}
   hook_script=${hook_parts#*$'\x1f'}
   if [ -z "$hook_interp" ]; then
-    # No token in the command was recognisable as a Python. `/bin/false
-    # <usage.py> hookline` lands here: it resolves and the file exists, so the
-    # older checks passed it while Claude Code got no hook output at all.
-    fail "no Python interpreter in the hook command: $hook_cmd_stored"
+    fail "could not tell what the hook command invokes: $hook_cmd_stored"
+    printf '        fix the command in settings.json, or invoke the hook yourself to test it\n'
+  elif ! looks_like_python "$hook_interp"; then
+    # Recognition gates everything below it, including `command -v`. The probe is
+    # the only place --check runs a program it did not choose, and `-c` is inert
+    # only for things that read it the way Python does -- `shutdown -c` cancels a
+    # pending shutdown -- so an unrecognised program is reported, never executed
+    # to find out what it is. `/bin/false <usage.py> hookline` lands here, and so
+    # does `printf python3 <usage.py> hookline`: the python3 in it is an argument
+    # to printf, not the program, and only checking the *invoked* position tells
+    # those apart.
+    fail "hook command does not invoke a Python: $hook_interp"
     printf '        --check will not run an unrecognised program to find out what it does —\n'
     printf '        fix the command in settings.json, or invoke the hook yourself to test it\n'
   elif ! command -v "$hook_interp" > /dev/null 2>&1; then
@@ -1214,15 +1257,6 @@ PY
     printf '        Claude Code cannot fire the hook — fix the command in settings.json\n'
   elif [ -n "$hook_script" ] && [ ! -f "$hook_script" ]; then
     fail "hook script does not exist: $hook_script"
-  elif ! looks_like_python "$hook_interp"; then
-    # Checked by name *before* running anything. The probe below is the only
-    # place --check executes a program it did not choose, and `-c` is inert only
-    # for things that read it the way Python does: `shutdown -c` cancels a
-    # pending shutdown. settings.json is hand-edited and not ours, so a name we
-    # do not recognise is reported, never executed to find out.
-    fail "hook interpreter does not look like Python: $hook_interp"
-    printf '        --check will not run an unrecognised program to find out — fix the\n'
-    printf '        command in settings.json, or invoke the hook yourself to test it\n'
   elif ! "$hook_interp" -c 'pass' > /dev/null 2>&1; then
     # Resolving a name proves nothing about what it does: `/bin/false <usage.py>
     # hookline` passes `command -v` and the file check, then produces no hook
