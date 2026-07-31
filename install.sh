@@ -204,6 +204,47 @@ PY_LONG_VALUE_OPTS = ("--check-hash-based-pycs",)
 PY_LETTER_TERMINATING = "hV?"   # print something and exit before any script
 PY_LETTER_NO_SCRIPT = "cm"      # the program comes from the option, not a file
 PY_LETTER_VALUE = "WX"          # consume a value, attached or as the next word
+# Every short option CPython accepts. An unrecognised one is not a flag to step
+# over: `python3 -Z x.py` exits 2 with "Unknown option" and never runs anything.
+PY_LETTER_KNOWN = "bBcdEhiImOPqRsSuvVWxX?"
+PY_LONG_KNOWN = ("--version", "--check-hash-based-pycs")
+
+
+def python_unsupported_option(argv):
+    """The first option CPython would reject, or "".
+
+    Skipping an unknown option as though it were a harmless flag identified the
+    script behind it as the operand, so the probe passed and --check reported a
+    registration that exits 2 without producing a line. Walks the same option
+    stream as python_script_operand, and stops at the first thing that settles
+    the question.
+    """
+    i = 1
+    while i < len(argv):
+        t = argv[i]
+        if not t.startswith("-") or t in ("-", "--"):
+            return ""                         # operand reached; options done
+        if t.startswith("--"):
+            name = t.split("=", 1)[0]
+            if not (name.startswith("--help") or name in PY_LONG_KNOWN):
+                return name
+            i += 1
+            if name in PY_LONG_VALUE_OPTS and "=" not in t and i < len(argv):
+                i += 1
+            continue
+        takes_next = False
+        for k, ch in enumerate(t[1:], start=1):
+            if ch not in PY_LETTER_KNOWN:
+                return "-" + ch
+            if ch in PY_LETTER_NO_SCRIPT or ch in PY_LETTER_TERMINATING:
+                return ""                     # the rest of the line is its own
+            if ch in PY_LETTER_VALUE:
+                takes_next = (k == len(t) - 1)
+                break
+        i += 1
+        if takes_next and i < len(argv):
+            i += 1
+    return ""
 
 
 def python_script_operand(argv):
@@ -1365,26 +1406,29 @@ exec(os.environ["PY_PRELUDE"])   # effective_argv() — single definition, see t
 cmd = os.environ.get("HC", "")
 usage = os.environ.get("UD", "")
 if not _split_ok(cmd):
-    print("\x1f\x1fbadquote")
+    print("\x1f\x1fbadquote\x1f")
 else:
     w = effective_argv(cmd)
     prog = w[0] if w else ""
     operand = python_script_operand(w)
+    badopt = python_unsupported_option(w)
     # The operand has to *be* usage.py, not merely exist. `python3 /tmp/noop.py
     # <usage.py> hookline` resolves correctly to noop.py, and the recogniser
     # still matches the trailing path followed by the mode word -- so checking
     # only that the operand existed reported a command that runs an entirely
     # different script as verified.
-    if not operand:
+    if badopt:
+        status = "badoption"          # checked first: it fails regardless
+    elif not operand:
         status = "noscript"
     elif usage and os.path.realpath(operand) != os.path.realpath(usage):
         status = "wrongscript"
     else:
         status = ""
-    print(prog + "\x1f" + operand + "\x1f" + status)
+    print(prog + "\x1f" + operand + "\x1f" + status + "\x1f" + badopt)
 PY
 )
-  IFS=$'\x1f' read -r hook_interp hook_script hook_status <<< "$hook_parts"
+  IFS=$'\x1f' read -r hook_interp hook_script hook_status hook_badopt <<< "$hook_parts"
   if [ "$hook_status" = "badquote" ]; then
     # shlex rejected the string and the whitespace fallback is for recognition
     # only. A shell will not run this either — it dies on the unterminated quote
@@ -1410,6 +1454,14 @@ PY
   elif ! command -v "$hook_interp" > /dev/null 2>&1; then
     fail "hook interpreter not found: $hook_interp"
     printf '        Claude Code cannot fire the hook — fix the command in settings.json\n'
+  elif [ "$hook_status" = "badoption" ]; then
+    # An option CPython does not accept. It exits 2 with "Unknown option" before
+    # running anything, so the script named behind it is irrelevant -- but a
+    # parser that steps over unknown options as though they were harmless flags
+    # identified that script as the operand and passed the whole check.
+    fail "hook command uses an option Python rejects: $hook_badopt"
+    printf '        python exits with "Unknown option" and never runs the hook —\n'
+    printf '        fix the command in settings.json\n'
   elif [ "$hook_status" = "noscript" ]; then
     # The interpreter is a Python, but its own options leave it nothing to run:
     # `python3 -c pass <usage.py> hookline` executes the -c string and passes the
@@ -1429,14 +1481,20 @@ PY
     printf '        fix the command in settings.json\n'
   elif [ ! -f "$hook_script" ]; then
     fail "hook script does not exist: $hook_script"
-  elif ! "$hook_interp" -c 'pass' > /dev/null 2>&1; then
+  elif ! "$hook_interp" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 7) else 1)' > /dev/null 2>&1; then
     # Resolving a name proves nothing about what it does: `/bin/false <usage.py>
     # hookline` passes `command -v` and the file check, then produces no hook
-    # output at all. `-c pass` is the cheapest proof that the registered program
-    # is actually a working Python, and it touches neither the network nor
-    # usage.py, so --check keeps its promise.
-    fail "hook interpreter is not a usable Python: $hook_interp"
-    printf '        it resolves, but cannot run `-c pass` — Claude Code gets no hook output\n'
+    # output at all.
+    #
+    # The probe asks for the version rather than just `pass`, because `pass` is
+    # valid Python 2 and looks_like_python accepts `python2` (and a bare
+    # `python`, which on an older box is one). usage.py is Python 3 throughout
+    # and the README requires 3.7+, so a Python 2 registration satisfied every
+    # check here and then failed on syntax before printing a line. Still inert,
+    # still no network, still never touches usage.py.
+    fail "hook interpreter is not Python 3.7+: $hook_interp"
+    printf '        it runs, but usage.py needs Python 3.7 or newer — Claude Code\n'
+    printf '        gets no hook output. Point the command at a python3.\n'
   else
     ok "hook registered (a direct usage.py call — interpreter runs Python and the"
     printf '        script exists; not executed under --check, which makes no network call)\n'

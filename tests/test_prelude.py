@@ -56,6 +56,7 @@ shell_assign = ns["_shell_assignment"]
 env_assign = ns["_env_assignment"]
 argv_of = ns["effective_argv"]
 operand = ns["python_script_operand"]
+badopt = ns["python_unsupported_option"]
 
 U = "/abs/usage.py"
 SL = "/abs/statusline.sh"
@@ -140,6 +141,25 @@ check("--help-all", operand(["python3", "--help-all", U]), "")
 check("--help-env", operand(["python3", "--help-env", U]), "")
 # -v is verbose, not terminating: the script still runs.
 check("-v is not terminating", operand(["python3", "-v", U]), U)
+
+# --- python_unsupported_option: options CPython rejects ---------------------
+# An unknown option is not a harmless flag. `python3 -Z x.py` exits 2 with
+# "Unknown option" and never runs the script, so skipping it identified that
+# script as the operand and passed the whole check.
+check("unknown short letter", badopt(["python3", "-Z", U]), "-Z")
+check("unknown long option", badopt(["python3", "--bogus", U]), "--bogus")
+check("unknown inside a cluster", badopt(["python3", "-uZ", U]), "-Z")
+check("known flags are fine", badopt(["python3", "-u", U]), "")
+check("known cluster is fine", badopt(["python3", "-uB", U]), "")
+check("-W value is not an option", badopt(["python3", "-W", "ignore", U]), "")
+check("-X value is not an option", badopt(["python3", "-X", "utf8", U]), "")
+check("--help is known", badopt(["python3", "--help", U]), "")
+check("--version is known", badopt(["python3", "--version", U]), "")
+check("--check-hash-based-pycs is known",
+      badopt(["python3", "--check-hash-based-pycs", "always", U]), "")
+check("options end at the operand", badopt(["python3", U, "-Z"]), "")
+# -c takes the rest of the line, so nothing after it is an option we judge
+check("after -c nothing is judged", badopt(["python3", "-c", "pass", "-Z"]), "")
 
 if failures:
     print(f"FAILED ({len(failures)}):", file=sys.stderr)
