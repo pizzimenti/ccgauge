@@ -193,6 +193,9 @@ def effective_argv(cmd, _depth=0):
 # is no script file at all.
 PY_VALUE_OPTS = ("-W", "-X", "--check-hash-based-pycs")
 PY_NO_SCRIPT = ("-c", "-m")
+# Options that make Python print something and exit before it reaches a script.
+# They are not flags to step over: the file named after one is never run.
+PY_TERMINATING = ("-h", "-?", "-V", "--version")
 
 
 def python_script_operand(argv):
@@ -215,6 +218,8 @@ def python_script_operand(argv):
         if t in PY_NO_SCRIPT or any(
                 t.startswith(o) and len(t) > 2 for o in PY_NO_SCRIPT):
             return ""                         # -c/-m, attached or separate
+        if t in PY_TERMINATING or t.startswith("--help"):
+            return ""                         # prints and exits; nothing runs
         if t == "--":
             return argv[i + 1] if i + 1 < len(argv) else ""
         i += 1
@@ -1311,7 +1316,7 @@ elif [ "$CHECK_ONLY" -eq 1 ] && [ "$hook_via_script" -eq 0 ]; then
   # *installer's* python3, never the one the registration names. A registration
   # like `missing-python <usage.py> hookline` therefore passed everything and
   # exited 0 while Claude Code could not fire the hook at all.
-  hook_parts=$(HC="$hook_cmd_stored" python3 - <<'PY' 2>/dev/null
+  hook_parts=$(HC="$hook_cmd_stored" UD="$USAGE_DST" python3 - <<'PY' 2>/dev/null
 import os, shlex
 exec(os.environ["PY_PRELUDE"])   # effective_argv() — single definition, see the top
 
@@ -1337,16 +1342,29 @@ exec(os.environ["PY_PRELUDE"])   # effective_argv() — single definition, see t
 # accepted it. An unparseable command is rejected outright rather than recovered
 # from, since the shell will not run it either.
 cmd = os.environ.get("HC", "")
+usage = os.environ.get("UD", "")
 if not _split_ok(cmd):
     print("\x1f\x1fbadquote")
 else:
     w = effective_argv(cmd)
     prog = w[0] if w else ""
-    print(prog + "\x1f" + python_script_operand(w) + "\x1f")
+    operand = python_script_operand(w)
+    # The operand has to *be* usage.py, not merely exist. `python3 /tmp/noop.py
+    # <usage.py> hookline` resolves correctly to noop.py, and the recogniser
+    # still matches the trailing path followed by the mode word -- so checking
+    # only that the operand existed reported a command that runs an entirely
+    # different script as verified.
+    if not operand:
+        status = "noscript"
+    elif usage and os.path.realpath(operand) != os.path.realpath(usage):
+        status = "wrongscript"
+    else:
+        status = ""
+    print(prog + "\x1f" + operand + "\x1f" + status)
 PY
 )
-  IFS=$'\x1f' read -r hook_interp hook_script hook_badquote <<< "$hook_parts"
-  if [ "$hook_badquote" = "badquote" ]; then
+  IFS=$'\x1f' read -r hook_interp hook_script hook_status <<< "$hook_parts"
+  if [ "$hook_status" = "badquote" ]; then
     # shlex rejected the string and the whitespace fallback is for recognition
     # only. A shell will not run this either — it dies on the unterminated quote
     # — so reporting every other check as passed would be a lie about a hook
@@ -1371,15 +1389,23 @@ PY
   elif ! command -v "$hook_interp" > /dev/null 2>&1; then
     fail "hook interpreter not found: $hook_interp"
     printf '        Claude Code cannot fire the hook — fix the command in settings.json\n'
-  elif [ -z "$hook_script" ]; then
+  elif [ "$hook_status" = "noscript" ]; then
     # The interpreter is a Python, but its own options leave it nothing to run:
     # `python3 -c pass <usage.py> hookline` executes the -c string and passes the
     # path as sys.argv[1]. The recogniser sees usage.py followed by the mode word
     # and calls it registered; only resolving Python's script *operand* catches
-    # that the file is never executed. -m and a bare `-` are the same shape.
+    # that the file is never executed. -m, a bare `-`, and the terminating
+    # options (--help, -V) are the same shape.
     fail "hook command never runs usage.py: $hook_cmd_stored"
-    printf '        an interpreter option (-c, -m, -) takes its place, so the hook\n'
-    printf '        produces nothing — fix the command in settings.json\n'
+    printf '        an interpreter option (-c, -m, -, --help, -V) takes its place, so\n'
+    printf '        the hook produces nothing — fix the command in settings.json\n'
+  elif [ "$hook_status" = "wrongscript" ]; then
+    # Recognition only proves usage.py appears somewhere with a mode word after
+    # it. `python3 /tmp/noop.py <usage.py> hookline` runs noop.py and passes ours
+    # along as an argument, so an operand that merely *exists* proves nothing.
+    fail "hook command runs a different script: $hook_script"
+    printf '        it is not %s, so the hook produces no usage line —\n' "$USAGE_DST"
+    printf '        fix the command in settings.json\n'
   elif [ ! -f "$hook_script" ]; then
     fail "hook script does not exist: $hook_script"
   elif ! "$hook_interp" -c 'pass' > /dev/null 2>&1; then
