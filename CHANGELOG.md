@@ -4,7 +4,7 @@ All notable changes to ccgauge are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); this project uses
 [Semantic Versioning](https://semver.org/).
 
-## [0.10.0] — 2026-07-30
+## [0.10.0] — 2026-07-31
 
 Hardens the installer against the configurations it can actually meet on a real
 machine — a status line the user wrote themselves, a registration written by the
