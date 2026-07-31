@@ -3,12 +3,15 @@
 # context, then warm the cache for next turn.
 #
 # `line` runs FIRST and in the foreground. In the common case (active session,
-# warm cache) it prints instantly. When the cache has gone stale — the first
-# prompt after an idle gap — `line` does one bounded, self-throttled synchronous
-# fetch so it shows live numbers instead of a STALE marker that a good value
-# would replace on the very next turn. Running it before the background refresh
-# lets it win the refresh lock, so the freshen is deterministic (no race with a
-# detached sibling).
+# cache still within its TTL) it prints instantly. Once the cache is past the
+# TTL — the first prompt after any idle gap — `line` does one bounded,
+# self-throttled synchronous fetch, so it shows live numbers rather than
+# whatever the previous turn's background refresh happened to leave behind.
+# That matters because this line lands in context *before* the refresh below
+# runs: without the synchronous fetch the number shown is always one turn
+# behind. Running `line` before the background refresh also lets it win the
+# refresh lock, so the freshen is deterministic (no race with a detached
+# sibling).
 #
 # The trailing background refresh keeps the cache fresh within its TTL for the
 # *next* turn without adding prompt latency: detached with stdout/stderr/stdin
