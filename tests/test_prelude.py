@@ -102,6 +102,9 @@ check("env --split-string= splits into the command",
 check("env -C consumes its value",
       argv_of("env -C /tmp python3 " + U)[0], "python3")
 check("env -- ends its options", argv_of("env -- python3 " + U)[0], "python3")
+# env's own print-and-exit options run no command at all.
+check("env --help runs nothing", argv_of("env --help python3 " + U), [])
+check("env --version runs nothing", argv_of("env --version python3 " + U), [])
 check("env bash reads the file", argv_of("env bash " + SL), ["bash", SL])
 check("env bare execs the file", argv_of("env " + SL), [SL])
 check("python as an argument is not the program",
@@ -124,6 +127,14 @@ check("--help", operand(["python3", "--help", U, "hookline"]), "")
 check("-h", operand(["python3", "-h", U]), "")
 check("-V", operand(["python3", "-V", U]), "")
 check("-VV", operand(["python3", "-VV", U]), "")
+# Short options cluster, so the letters decide, not the whole token. Matching
+# exact strings meant -V, then -VV, then -uV each had to be found separately.
+check("-uV cluster terminates", operand(["python3", "-uV", U]), "")
+check("-Vu cluster terminates", operand(["python3", "-Vu", U]), "")
+check("-uc cluster takes the program", operand(["python3", "-uc", "pass", U]), "")
+check("-uB is only plain flags", operand(["python3", "-uB", U]), U)
+check("-uW attached value", operand(["python3", "-uWignore", U]), U)
+check("-uW separate value", operand(["python3", "-uW", "ignore", U]), U)
 check("--version", operand(["python3", "--version", U]), "")
 check("--help-all", operand(["python3", "--help-all", U]), "")
 check("--help-env", operand(["python3", "--help-env", U]), "")

@@ -116,6 +116,11 @@ _SHELL_ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 
 ENV_VALUE_OPTS = ("-u", "--unset", "-C", "--chdir")
 ENV_SPLIT_OPTS = ("-S", "--split-string")
+# env has its own print-and-exit options, and they precede the command rather
+# than being part of it: `env --help python3 x.py` runs nothing at all. Skipping
+# them as generic flags landed on python3 and validated an interpreter that is
+# never reached.
+ENV_TERMINATING = ("--help", "--version")
 
 
 def _env_assignment(tok):
@@ -171,6 +176,8 @@ def effective_argv(cmd, _depth=0):
                     continue
                 if not t.startswith("-"):
                     break
+                if t in ENV_TERMINATING:
+                    return []                 # env prints and exits; no command
                 if t in ENV_SPLIT_OPTS and i + 1 < len(w):
                     return effective_argv(w[i + 1], _depth + 1) + w[i + 2:]
                 inline = ""
@@ -189,13 +196,14 @@ def effective_argv(cmd, _depth=0):
     return w[i:]
 
 
-# Interpreter options that consume a separate value, and the two that mean there
-# is no script file at all.
-PY_VALUE_OPTS = ("-W", "-X", "--check-hash-based-pycs")
-PY_NO_SCRIPT = ("-c", "-m")
-# Options that make Python print something and exit before it reaches a script.
-# They are not flags to step over: the file named after one is never run.
-PY_TERMINATING = ("-h", "-?", "-V", "--version")
+PY_LONG_VALUE_OPTS = ("--check-hash-based-pycs",)
+# Short options classified by letter, because they cluster: -uV is -u then -V,
+# and matching whole tokens misses every mixed spelling. Three rounds of this
+# were spent adding one more exact string at a time (-V, then -VV, then -uV);
+# the letters are what actually decide.
+PY_LETTER_TERMINATING = "hV?"   # print something and exit before any script
+PY_LETTER_NO_SCRIPT = "cm"      # the program comes from the option, not a file
+PY_LETTER_VALUE = "WX"          # consume a value, attached or as the next word
 
 
 def python_script_operand(argv):
@@ -205,28 +213,38 @@ def python_script_operand(argv):
     the program and the path is just sys.argv[1] -- yet the path is right there
     in the command, followed by the mode word, so both the recogniser and a scan
     for "any .py token" accepted it and the hook was reported as verified while
-    producing nothing. -m is the same shape. So is a bare `-`, which reads the
-    program from stdin.
+    producing nothing. -m is the same shape, so is a bare `-` reading the program
+    from stdin, and so are the options that print and exit (-h, -V, -VV, --help,
+    --version): the file named after one of those is never run either.
     """
     i = 1                                     # argv[0] is the interpreter
     while i < len(argv):
         t = argv[i]
         if t == "-":
-            return ""
+            return ""                         # program on stdin
         if not t.startswith("-"):
             return t                          # first operand is the script
-        if t in PY_NO_SCRIPT or any(
-                t.startswith(o) and len(t) > 2 for o in PY_NO_SCRIPT):
-            return ""                         # -c/-m, attached or separate
-        # -V repeats: -VV prints build detail and exits just as -V does, and
-        # --help-all / --help-env are spellings of --help.
-        if (t in PY_TERMINATING or t.startswith("--help")
-                or re.match(r"^-V+$", t)):
-            return ""                         # prints and exits; nothing runs
         if t == "--":
             return argv[i + 1] if i + 1 < len(argv) else ""
+        if t.startswith("--"):
+            if t.startswith("--help") or t == "--version":
+                return ""
+            i += 1
+            if t in PY_LONG_VALUE_OPTS and i < len(argv):
+                i += 1
+            continue
+        # A short-option cluster. Walk its letters: the first one that decides
+        # the question ends the token, and only a value-taking letter in final
+        # position reaches into the next word.
+        takes_next = False
+        for k, ch in enumerate(t[1:], start=1):
+            if ch in PY_LETTER_TERMINATING or ch in PY_LETTER_NO_SCRIPT:
+                return ""
+            if ch in PY_LETTER_VALUE:
+                takes_next = (k == len(t) - 1)
+                break                         # anything after it is the value
         i += 1
-        if t in PY_VALUE_OPTS and i < len(argv):
+        if takes_next and i < len(argv):
             i += 1
     return ""
 
