@@ -72,15 +72,46 @@ done
 # place drifted — the writer quoted the path while the verifier compared it raw,
 # so a correct install reported itself broken.
 PY_PRELUDE='
-import os, shlex
+import os, re, shlex
 
 
 def _words(cmd):
-    """Split a command string the way a shell would, never raising."""
+    """Split a command string the way a shell would, never raising.
+
+    The whitespace fallback is for *recognition* only — deciding whether a
+    registration is already ours, where being generous means we decline to add a
+    second one. It must never stand in for validation: see _split_ok.
+    """
     try:
         return shlex.split(cmd)
     except ValueError:
         return cmd.split()
+
+
+def _split_ok(cmd):
+    """Does this command string parse as valid shell quoting?
+
+    A hand-edited command ending in a stray quote character is unterminated.
+    shlex rejects it correctly, and _words then hands back plausible-looking
+    tokens that every check downstream accepts — so the installer reported all
+    checks passed on a command the shell refuses to run at all. Validation asks
+    this first.
+    """
+    if not isinstance(cmd, str):
+        return False
+    try:
+        shlex.split(cmd)
+        return True
+    except ValueError:
+        return False
+
+
+# A shell assignment prefix has to be a valid identifier. `bad-name=1 python3
+# x.py` is not one: the shell does not treat it as an assignment, it tries to
+# *execute* `bad-name=1` and exits 127. Skipping it as a prefix validated the
+# python3 behind it and reported a hook that never fires. env is deliberately
+# more permissive about what it accepts after itself, so it keeps its own test.
+_SHELL_ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 
 
 ENV_VALUE_OPTS = ("-u", "--unset", "-C", "--chdir")
@@ -88,8 +119,18 @@ ENV_SPLIT_OPTS = ("-S", "--split-string")
 
 
 def _env_assignment(tok):
+    """A NAME=VALUE token as `env` itself accepts it — deliberately permissive."""
     return ("=" in tok and not tok.startswith("-")
             and not tok.startswith("/") and not tok.startswith("."))
+
+
+def _shell_assignment(tok):
+    """A NAME=VALUE token a *shell* would treat as an assignment prefix.
+
+    Stricter than the env form on purpose: the shell requires a valid identifier
+    and executes anything else. See _SHELL_ASSIGN.
+    """
+    return bool(_SHELL_ASSIGN.match(tok))
 
 
 def _prog_base(tok):
@@ -115,7 +156,7 @@ def effective_argv(cmd, _depth=0):
         return w
     i = 0
     while i < len(w):
-        if _env_assignment(w[i]):
+        if _shell_assignment(w[i]):
             i += 1
             continue
         if _prog_base(w[i]) == "env":
@@ -146,6 +187,40 @@ def effective_argv(cmd, _depth=0):
             continue
         break
     return w[i:]
+
+
+# Interpreter options that consume a separate value, and the two that mean there
+# is no script file at all.
+PY_VALUE_OPTS = ("-W", "-X", "--check-hash-based-pycs")
+PY_NO_SCRIPT = ("-c", "-m")
+
+
+def python_script_operand(argv):
+    """The file Python would actually execute, or "" if the options preclude one.
+
+    `python3 -c pass <usage.py> hookline` never runs usage.py -- the -c string is
+    the program and the path is just sys.argv[1] -- yet the path is right there
+    in the command, followed by the mode word, so both the recogniser and a scan
+    for "any .py token" accepted it and the hook was reported as verified while
+    producing nothing. -m is the same shape. So is a bare `-`, which reads the
+    program from stdin.
+    """
+    i = 1                                     # argv[0] is the interpreter
+    while i < len(argv):
+        t = argv[i]
+        if t == "-":
+            return ""
+        if not t.startswith("-"):
+            return t                          # first operand is the script
+        if t in PY_NO_SCRIPT or any(
+                t.startswith(o) and len(t) > 2 for o in PY_NO_SCRIPT):
+            return ""                         # -c/-m, attached or separate
+        if t == "--":
+            return argv[i + 1] if i + 1 < len(argv) else ""
+        i += 1
+        if t in PY_VALUE_OPTS and i < len(argv):
+            i += 1
+    return ""
 
 
 def _resolves_to(word, rt):
@@ -906,7 +981,11 @@ except Exception:
 # reads the file and needs no execute bit -- saw words[0] == "env", matched no
 # interpreter, and failed a status line that works. `env <path>` still requires
 # the bit, because after resolution the path *is* argv[0].
-words = effective_argv(cmd) if isinstance(cmd, str) else []
+# Invalid quoting yields no words, so nothing can match the proven interpreter
+# shape and the substring test below decides: a command that mentions the path
+# keeps the execute-bit requirement. A command we cannot parse is not a command
+# we can prove safe.
+words = effective_argv(cmd) if _split_ok(cmd) else []
 
 sl = os.path.realpath(os.environ["SL"])
 idx = next((i for i, w in enumerate(words)
@@ -1251,15 +1330,30 @@ exec(os.environ["PY_PRELUDE"])   # effective_argv() — single definition, see t
 # unrecognised is reported, never executed -- `-c` is inert only for programs
 # that read it the way Python does (`shutdown -c` cancels a shutdown), and
 # settings.json is hand-edited and not ours.
-w = effective_argv(os.environ.get("HC", ""))
-prog = w[0] if w else ""
-script = next((x for x in w if x.endswith(".py")), "")
-print(prog + "\x1f" + script)
+#
+# The script is Python's *operand*, not the first .py token lying around:
+# `python3 -c pass <usage.py> hookline` never runs the file, and the path is
+# right there followed by the mode word, so both the recogniser and a naive scan
+# accepted it. An unparseable command is rejected outright rather than recovered
+# from, since the shell will not run it either.
+cmd = os.environ.get("HC", "")
+if not _split_ok(cmd):
+    print("\x1f\x1fbadquote")
+else:
+    w = effective_argv(cmd)
+    prog = w[0] if w else ""
+    print(prog + "\x1f" + python_script_operand(w) + "\x1f")
 PY
 )
-  hook_interp=${hook_parts%%$'\x1f'*}
-  hook_script=${hook_parts#*$'\x1f'}
-  if [ -z "$hook_interp" ]; then
+  IFS=$'\x1f' read -r hook_interp hook_script hook_badquote <<< "$hook_parts"
+  if [ "$hook_badquote" = "badquote" ]; then
+    # shlex rejected the string and the whitespace fallback is for recognition
+    # only. A shell will not run this either — it dies on the unterminated quote
+    # — so reporting every other check as passed would be a lie about a hook
+    # that never fires.
+    fail "hook command has invalid shell quoting: $hook_cmd_stored"
+    printf '        the shell cannot run it — fix the quoting in settings.json\n'
+  elif [ -z "$hook_interp" ]; then
     fail "could not tell what the hook command invokes: $hook_cmd_stored"
     printf '        fix the command in settings.json, or invoke the hook yourself to test it\n'
   elif ! looks_like_python "$hook_interp"; then
@@ -1277,7 +1371,16 @@ PY
   elif ! command -v "$hook_interp" > /dev/null 2>&1; then
     fail "hook interpreter not found: $hook_interp"
     printf '        Claude Code cannot fire the hook — fix the command in settings.json\n'
-  elif [ -n "$hook_script" ] && [ ! -f "$hook_script" ]; then
+  elif [ -z "$hook_script" ]; then
+    # The interpreter is a Python, but its own options leave it nothing to run:
+    # `python3 -c pass <usage.py> hookline` executes the -c string and passes the
+    # path as sys.argv[1]. The recogniser sees usage.py followed by the mode word
+    # and calls it registered; only resolving Python's script *operand* catches
+    # that the file is never executed. -m and a bare `-` are the same shape.
+    fail "hook command never runs usage.py: $hook_cmd_stored"
+    printf '        an interpreter option (-c, -m, -) takes its place, so the hook\n'
+    printf '        produces nothing — fix the command in settings.json\n'
+  elif [ ! -f "$hook_script" ]; then
     fail "hook script does not exist: $hook_script"
   elif ! "$hook_interp" -c 'pass' > /dev/null 2>&1; then
     # Resolving a name proves nothing about what it does: `/bin/false <usage.py>
