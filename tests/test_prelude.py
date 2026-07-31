@@ -27,13 +27,26 @@ INSTALL_SH = HERE.parent / "install.sh"
 
 
 def load_prelude():
-    """exec PY_PRELUDE out of install.sh and return its namespace."""
+    """exec PY_PRELUDE out of install.sh and return its namespace.
+
+    Failures here name their cause. A bare ValueError from str.index would say
+    only "substring not found" — a confusing way to learn that the block was
+    renamed or the closing quote reindented, in a test whose whole point is
+    tracking the real source rather than a copy.
+    """
     src = INSTALL_SH.read_text()
     marker = "PY_PRELUDE='"
-    start = src.index(marker) + len(marker)
-    end = src.index("\n'\n", start)
+    pos = src.find(marker)
+    if pos < 0:
+        raise SystemExit(f"{INSTALL_SH}: no {marker} block found")
+    start = pos + len(marker)
+    end = src.find("\n'\n", start)
+    if end < 0:
+        raise SystemExit(f"{INSTALL_SH}: unterminated {marker} block")
     ns = {}
-    exec(compile(src[start:end], "PY_PRELUDE", "exec"), ns)
+    # exec is deliberate: it is what keeps this testing the shipped prelude
+    # rather than a second copy that can drift out from under it.
+    exec(compile(src[start:end], "PY_PRELUDE", "exec"), ns)  # noqa: S102
     return ns
 
 
@@ -82,6 +95,13 @@ check("env unwrapped", argv_of("env python3 " + U)[0], "python3")
 check("env -u consumes its value", argv_of("env -u FOO python3 " + U)[0], "python3")
 check("env -S splits into the command",
       argv_of("env -S python3 " + U + " hookline")[0], "python3")
+check("env -S attached splits into the command",
+      argv_of("env -Spython3 " + U)[0], "python3")
+check("env --split-string= splits into the command",
+      argv_of("env --split-string=python3 " + U)[0], "python3")
+check("env -C consumes its value",
+      argv_of("env -C /tmp python3 " + U)[0], "python3")
+check("env -- ends its options", argv_of("env -- python3 " + U)[0], "python3")
 check("env bash reads the file", argv_of("env bash " + SL), ["bash", SL])
 check("env bare execs the file", argv_of("env " + SL), [SL])
 check("python as an argument is not the program",
@@ -91,6 +111,10 @@ check("python as an argument is not the program",
 check("plain script", operand(["python3", U, "hookline"]), U)
 check("flag before script", operand(["python3", "-u", U, "hookline"]), U)
 check("-W takes a value", operand(["python3", "-W", "ignore", U]), U)
+check("-X takes a value", operand(["python3", "-X", "utf8", U]), U)
+check("--check-hash-based-pycs takes a value",
+      operand(["python3", "--check-hash-based-pycs", "always", U]), U)
+check("-- ends the options", operand(["python3", "--", U, "hookline"]), U)
 check("-c takes its place", operand(["python3", "-c", "pass", U, "hookline"]), "")
 check("-m takes its place", operand(["python3", "-m", "mod", U, "hookline"]), "")
 check("attached -c", operand(["python3", "-cpass", U]), "")
@@ -99,7 +123,9 @@ check("stdin", operand(["python3", "-", U]), "")
 check("--help", operand(["python3", "--help", U, "hookline"]), "")
 check("-h", operand(["python3", "-h", U]), "")
 check("-V", operand(["python3", "-V", U]), "")
+check("-VV", operand(["python3", "-VV", U]), "")
 check("--version", operand(["python3", "--version", U]), "")
+check("--help-all", operand(["python3", "--help-all", U]), "")
 check("--help-env", operand(["python3", "--help-env", U]), "")
 # -v is verbose, not terminating: the script still runs.
 check("-v is not terminating", operand(["python3", "-v", U]), U)

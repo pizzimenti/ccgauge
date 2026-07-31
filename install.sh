@@ -218,7 +218,10 @@ def python_script_operand(argv):
         if t in PY_NO_SCRIPT or any(
                 t.startswith(o) and len(t) > 2 for o in PY_NO_SCRIPT):
             return ""                         # -c/-m, attached or separate
-        if t in PY_TERMINATING or t.startswith("--help"):
+        # -V repeats: -VV prints build detail and exits just as -V does, and
+        # --help-all / --help-env are spellings of --help.
+        if (t in PY_TERMINATING or t.startswith("--help")
+                or re.match(r"^-V+$", t)):
             return ""                         # prints and exits; nothing runs
         if t == "--":
             return argv[i + 1] if i + 1 < len(argv) else ""
