@@ -4,6 +4,59 @@ All notable changes to ccgauge are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); this project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.11.0] — 2026-08-01
+
+An install is an install. ccgauge installs its own status line, every time, on
+every machine — so the gauges look the same everywhere and after every update.
+The conditional behaviour that 0.9.0 and 0.10.0 built up around that decision is
+gone, along with the flag that existed to override it.
+
+### Removed
+
+- **`./install.sh --statusline`.** It existed because the installer would
+  otherwise refuse to touch a status line it had not written. Now it always
+  writes one, so there is nothing to override and no flag to remember. Passing
+  it is an error, like any other unknown argument.
+- **The marker-gated install decision.** `statusline.sh` is written on every
+  run. The `ccgauge-statusline-marker` string stays in the file and still tells
+  verification whether what is sitting there is ours, but it no longer decides
+  whether the file may be written.
+- **The preserved-foreign-status-line paths that hung off that decision**: the
+  execute-bit waiver and its command-shape analysis, the "not registering a
+  status line" and "leaving your existing status line alone" branches, and the
+  repair path for a registration naming the `statusline-snippet.sh` that 0.9.0
+  deleted. None of those states can arise from an install any more.
+
+### Changed
+
+- **An existing status line is replaced, and said so plainly.** The command that
+  was registered is printed, alongside the timestamped `settings.json` backup
+  that holds it.
+- **Verification reports deviation instead of preservation.** A status line
+  pointing somewhere else, or a `statusline.sh` that is not the one we ship, now
+  reads as something to restore with `./install.sh` rather than as a deliberate
+  arrangement to leave alone.
+
+### Why
+
+The tool's visible output is the point of installing it. Making that output
+conditional on state the user cannot see — a marker in a file, a flag they had
+to have read about — meant a first install could hand someone the hook, no
+gauges, and two warnings telling them to read the README and run it again. For a
+usage gauge, that fails toward the opposite of what was asked for.
+
+The thing worth protecting was never the *slot*; it was not silently destroying
+what was there. That is a backup guarantee, and it holds: every overwrite is
+backed up first, keyed on differing content, and **no backup ever overwrites an
+older one** — so a second run cannot destroy the copy that mattered. Verified by
+running the installer twice over a foreign status line: the first run backs up
+and takes over, the second reports "already registered", rewrites nothing, and
+leaves the backup count unchanged.
+
+To keep a status line of your own, point `statusLine` at it and don't re-run the
+installer — or call `usage.py status` from inside it, which is what the fragment
+mode is for.
+
 ## [0.10.0] — 2026-07-31
 
 Hardens the installer against the configurations it can actually meet on a real
