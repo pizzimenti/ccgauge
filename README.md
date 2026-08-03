@@ -115,6 +115,12 @@ Those two filenames are examples — substitute the ones `ls` printed. Don't typ
 them with a placeholder in angle brackets: the shell reads `<...>` as a
 redirection, so the command fails instead of restoring anything.
 
+**If your `settings.json` is a symlink** — into a dotfiles repo, say — its backup
+is written beside the file the link points at, not in the config directory, so
+the `ls` above will not list it. The installer prints the full path when it makes
+one (`backed up settings.json -> …`); use that. The status line backup is always
+in the config directory either way.
+
 The first line is the one that is easy to miss. If your status line already
 lived at `$CONFIG_DIR/statusline.sh`, then `settings.json` pointed at that path
 both before and after the install — so restoring `settings.json` alone changes

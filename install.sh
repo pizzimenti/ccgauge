@@ -839,7 +839,11 @@ if sl_raw is not None and sl is None:
     # and the user should see what it was rather than a bare "registered".
     current = json.dumps(sl_raw)
 
-if current == statusline_cmd and sl is not None:
+# The whole block has to be right, not just the command. A canonical command
+# under a wrong `type` is not a working registration, and testing the command
+# alone reported it as one and skipped the rewrite that would have fixed it.
+if isinstance(sl, dict) and sl.get("type") == "command" \
+        and current == statusline_cmd:
     print(f"  {G}ok{X}    status line already registered")
 else:
     # Naming our path is not the same as invoking it the way we do. `python3
