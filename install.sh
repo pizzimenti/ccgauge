@@ -579,20 +579,29 @@ PY
   # Probe the resolved directory the way the writer will use it. realpath via
   # python3 rather than `readlink -f`, which is GNU-only and silently yields
   # nothing on a BSD userland.
-  settings_dir=$(SETTINGS="$SETTINGS" python3 -c \
-    'import os; print(os.path.dirname(os.path.realpath(os.environ["SETTINGS"])))' \
-    2>/dev/null) || settings_dir=""
-  [ -n "$settings_dir" ] || settings_dir=$(dirname "$SETTINGS")
-  settings_probe="$settings_dir/.ccgauge-write-probe.$$"
-  if ! (: > "$settings_probe") 2>/dev/null; then
-    fail "cannot write beside settings.json — the directory is not writable:"
-    printf '        %s\n' "$settings_dir"
-    printf '        the installer has to create a backup and a temp file there.\n'
+  settings_real=$(SETTINGS="$SETTINGS" python3 -c \
+    'import os; print(os.path.realpath(os.environ["SETTINGS"]))' \
+    2>/dev/null) || settings_real=""
+  [ -n "$settings_real" ] || settings_real="$SETTINGS"
+  # Probe the writer's ACTUAL temp path, not merely some file in the directory.
+  # The temp name is fixed (`<settings.json>.tmp`), so an interrupted run or a
+  # stray mkdir can leave a *directory* sitting on it: a generic probe elsewhere
+  # in the same directory then succeeds, the copy proceeds, and the writer dies
+  # on open(). Reproduced -- foreign status line replaced, then IsADirectoryError.
+  # Probing the real path is the only version of this check that tests what the
+  # writer will actually do.
+  settings_tmp="$settings_real.tmp"
+  if ! (: > "$settings_tmp") 2>/dev/null; then
+    fail "cannot write settings.json's temporary file:"
+    printf '        %s\n' "$settings_tmp"
+    printf '        something is in the way (a leftover directory?), or the\n'
+    printf '        directory is not writable. The installer needs to create\n'
+    printf '        both that file and a timestamped backup beside it.\n'
     echo
     printf '\033[0;31mccgauge: nothing was installed or changed.\033[0m\n' >&2
     exit 1
   fi
-  rm -f "$settings_probe" 2>/dev/null || true
+  rm -f "$settings_tmp" 2>/dev/null || true
 
   # Back up anything at a destination that differs from what we are about to
   # write. No content marker: an earlier version keyed on "does the file contain
@@ -989,8 +998,19 @@ except OSError:
 # Explicit utf-8: ensure_ascii=False above means `updated` can carry non-ASCII,
 # and the default encoding follows the ambient locale, which on a C/POSIX locale
 # raises UnicodeEncodeError mid-write.
-with open(tmp, "w", encoding="utf-8") as fh:
-    fh.write(updated)
+#
+# Guarded, like every other write in this script. The preflight now rejects a
+# blocked temp path before anything is copied, so reaching this is a race or a
+# permission change mid-run — but an unguarded open() here printed a raw
+# IsADirectoryError traceback, which is precisely the failure mode the defensive
+# parsing everywhere else exists to prevent.
+try:
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(updated)
+except OSError as exc:
+    print(f"  {R}FAIL{X}  could not write {tmp} ({exc})")
+    print( "        settings.json was not modified.")
+    sys.exit(1)
 if mode is not None:
     try:
         os.chmod(tmp, mode)
