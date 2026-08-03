@@ -504,6 +504,53 @@ if [ "$CHECK_ONLY" -eq 0 ]; then
     exit 1
   fi
 
+  # Settle settings.json BEFORE copying anything. Every reason this can fail --
+  # a dangling symlink, an unwritable directory, JSON we cannot parse -- used to
+  # be discovered after the three files had already been replaced, so the run
+  # exited non-zero having changed the install anyway.
+  #
+  # That was survivable while a foreign statusline.sh was skipped: a failed run
+  # left the user's own status line untouched. Now that it is always replaced,
+  # the same ordering means a failed install silently swaps the thing the user
+  # looks at, under a message saying settings.json was not modified -- true, and
+  # beside the point. Validate first; then nothing is touched unless everything
+  # can proceed.
+  if [ ! -f "$SETTINGS" ]; then
+    # `-f` is false for a dangling symlink too, and the redirect below would then
+    # fail under `set -e` with a bare shell error and no failure summary.
+    if [ -L "$SETTINGS" ]; then
+      fail "settings.json is a symlink to a missing target:"
+      printf '        %s -> %s\n' "$SETTINGS" "$(readlink "$SETTINGS")"
+      printf '        create the target (or remove the link) and re-run.\n'
+      echo
+      printf '\033[0;31mccgauge: nothing was installed or changed.\033[0m\n' >&2
+      exit 1
+    fi
+    if ! printf '{\n  "hooks": {}\n}\n' > "$SETTINGS" 2>/dev/null; then
+      fail "could not create $SETTINGS (is $CONFIG_DIR writable?)"
+      echo
+      printf '\033[0;31mccgauge: nothing was installed or changed.\033[0m\n' >&2
+      exit 1
+    fi
+    ok "created $SETTINGS"
+  fi
+  # Parse it here too. The writer further down rejects malformed JSON, but by
+  # then the copy has happened -- and "fix your settings.json" is much easier to
+  # act on when the installer has not also replaced your status line.
+  if ! SETTINGS="$SETTINGS" python3 -c '
+import json, os, sys
+try:
+    json.load(open(os.environ["SETTINGS"], encoding="utf-8-sig"))
+except Exception as exc:
+    sys.stderr.write(str(exc))
+    sys.exit(1)' 2>/dev/null; then
+    fail "settings.json is not valid JSON — fix it and re-run"
+    printf '        %s\n' "$SETTINGS"
+    echo
+    printf '\033[0;31mccgauge: nothing was installed or changed.\033[0m\n' >&2
+    exit 1
+  fi
+
   # Back up anything at a destination that differs from what we are about to
   # write. No content marker: an earlier version keyed on "does the file contain
   # ccgauge's header comment", which reads a *customised copy of our own script*
@@ -637,27 +684,6 @@ if [ "$CHECK_ONLY" -eq 0 ]; then
     exit 1
   fi
   ok "copied usage.py, hooks/usage-line.sh, statusline.sh"
-
-  if [ ! -f "$SETTINGS" ]; then
-    # `-f` is false for a dangling symlink too, and the redirect would then fail
-    # under `set -e` with a bare shell error and no failure summary — after the
-    # three files have already been copied, leaving a half-install.
-    if [ -L "$SETTINGS" ]; then
-      fail "settings.json is a symlink to a missing target:"
-      printf '        %s -> %s\n' "$SETTINGS" "$(readlink "$SETTINGS")"
-      printf '        create the target (or remove the link) and re-run.\n'
-      echo
-      printf '\033[0;31mccgauge: settings.json was not modified.\033[0m\n' >&2
-      exit 1
-    fi
-    if ! printf '{\n  "hooks": {}\n}\n' > "$SETTINGS" 2>/dev/null; then
-      fail "could not create $SETTINGS (is $CONFIG_DIR writable?)"
-      echo
-      printf '\033[0;31mccgauge: settings.json was not modified.\033[0m\n' >&2
-      exit 1
-    fi
-    ok "created $SETTINGS"
-  fi
 
   # Register the UserPromptSubmit hook and the status line, backing up first.
   #
