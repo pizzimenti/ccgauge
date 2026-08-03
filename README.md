@@ -195,9 +195,15 @@ rather than accumulating duplicates. As on Linux, the status line is always
 ccgauge's; `settings.json` is backed up to a timestamped file first, and only on
 a run that actually changes it. Then:
 
-1. **Verify:** `python "$env:USERPROFILE\.claude\usage.py" show` — substitute
-   the interpreter the installer said it picked (`py -3` on machines where
-   `python` is only the Store stub); its final output shows the exact command.
+1. **Verify:** the installer's closing output prints the exact command for your
+   machine — copy that. It already carries the interpreter it picked (`py -3` on
+   machines where `python` is only the Store stub) and the directory it actually
+   installed into, which is `$env:CLAUDE_CONFIG_DIR` when that is set:
+
+   ```powershell
+   $dir = if ($env:CLAUDE_CONFIG_DIR) { $env:CLAUDE_CONFIG_DIR } else { "$env:USERPROFILE\.claude" }
+   python "$dir\usage.py" show
+   ```
 2. **Restart** Claude Code (or start a new session) so the hook and status line
    load.
 

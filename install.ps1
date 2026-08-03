@@ -170,10 +170,14 @@ else:
     changed = True
     notes.append("registered status line")
 
-for note in notes:
-    print("ccgauge: " + note)
-
+# Nothing is announced until the outcome it describes is real. Printed up front,
+# a failed backup produced "registered status line" immediately followed by
+# "settings.json not modified" -- two lines contradicting each other, with the
+# true one second. The no-op path prints here because nothing downstream can
+# change it.
 if not changed:
+    for note in notes:
+        print("ccgauge: " + note)
     print("ccgauge: settings.json already correct -- not rewritten")
     sys.exit(0)
 
@@ -201,6 +205,10 @@ print("ccgauge: backed up settings.json -> " + os.path.basename(backup))
 with open(path, "w", encoding="utf-8", newline="\n") as fh:
     json.dump(cfg, fh, indent=2, ensure_ascii=False)
     fh.write("\n")
+
+# Now that it is true.
+for note in notes:
+    print("ccgauge: " + note)
 '@
 
 $env:CCGAUGE_HOOK_CMD = $hookCmd
