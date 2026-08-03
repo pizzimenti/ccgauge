@@ -534,18 +534,38 @@ if [ "$CHECK_ONLY" -eq 0 ]; then
     fi
     ok "created $SETTINGS"
   fi
-  # Parse it here too. The writer further down rejects malformed JSON, but by
-  # then the copy has happened -- and "fix your settings.json" is much easier to
-  # act on when the installer has not also replaced your status line.
-  if ! SETTINGS="$SETTINGS" python3 -c '
-import json, os, sys
+  # Check it here for every reason the writer would reject it, not just that it
+  # parses. `[]`, `{"hooks": 5}` and `{"hooks": {"UserPromptSubmit": 5}}` are all
+  # valid JSON and all fatal further down -- but only after the copy, which is
+  # the ordering this preflight exists to fix. Checking one of the writer's four
+  # reasons and calling the file validated just moves the same failure to a
+  # narrower set of inputs.
+  #
+  # Fail-open if python3 itself misbehaves: it is a verified prerequisite by this
+  # point, and the writer still rejects all of these independently. The gain here
+  # is where the rejection happens, not whether it happens.
+  settings_problem=$(SETTINGS="$SETTINGS" python3 - <<'PY' 2>/dev/null
+import json, os
+p = os.environ["SETTINGS"]
 try:
-    json.load(open(os.environ["SETTINGS"], encoding="utf-8-sig"))
+    cfg = json.load(open(p, encoding="utf-8-sig"))
 except Exception as exc:
-    sys.stderr.write(str(exc))
-    sys.exit(1)' 2>/dev/null; then
-    fail "settings.json is not valid JSON — fix it and re-run"
+    print(f"is not valid JSON ({exc})"); raise SystemExit(0)
+if not isinstance(cfg, dict):
+    print("top level is not a JSON object"); raise SystemExit(0)
+hooks = cfg.get("hooks")
+if hooks is not None and not isinstance(hooks, dict):
+    print("'hooks' is not an object"); raise SystemExit(0)
+if isinstance(hooks, dict):
+    groups = hooks.get("UserPromptSubmit")
+    if groups is not None and not isinstance(groups, list):
+        print("hooks.UserPromptSubmit is not a list"); raise SystemExit(0)
+PY
+)
+  if [ -n "$settings_problem" ]; then
+    fail "settings.json $settings_problem"
     printf '        %s\n' "$SETTINGS"
+    printf '        fix it by hand, or restore a settings.json.*.bak, then re-run.\n'
     echo
     printf '\033[0;31mccgauge: nothing was installed or changed.\033[0m\n' >&2
     exit 1
