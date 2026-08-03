@@ -542,9 +542,12 @@ if [ "$CHECK_ONLY" -eq 0 ]; then
   # reasons and calling the file validated just moves the same failure to a
   # narrower set of inputs.
   #
-  # Fail-open if python3 itself misbehaves: it is a verified prerequisite by this
-  # point, and the writer still rejects all of these independently. The gain here
-  # is where the rejection happens, not whether it happens.
+  # Fail-open if python3 itself misbehaves — that is what the `|| true` on the
+  # substitution is for. Without it `set -e` turns an interpreter-level failure
+  # here into a bare death with no summary: the opposite of open. python3 is a
+  # verified prerequisite by this point, and the writer still rejects all of
+  # these independently. The gain here is where the rejection happens, not
+  # whether it happens.
   # Only when there is something to check. With settings.json absent the file is
   # not created until phase 2, so reading it here would report "is not valid JSON
   # (No such file)" and fail every fresh install.
@@ -566,7 +569,7 @@ if isinstance(hooks, dict):
     if groups is not None and not isinstance(groups, list):
         print("hooks.UserPromptSubmit is not a list"); raise SystemExit(0)
 PY
-)
+) || true
     if [ -n "$settings_problem" ]; then
       fail "settings.json $settings_problem"
       printf '        %s\n' "$SETTINGS"
@@ -633,9 +636,13 @@ PY
   # What is *not* traded away is recoverability. Anything about to be overwritten
   # is backed up first, keyed on differing content, and no backup ever overwrites
   # an older one — so running this twice cannot destroy the copy that mattered.
-  # (The backups themselves run further down, immediately before the copy they
-  # protect — a settings failure that stops the copy must not leave .bak files
-  # for an overwrite that never happened.)
+  # (The backups run in phase 1, beside the staging — which means a phase-2
+  # settings failure the preflight could not see, a resolved directory that is
+  # not writable or a full disk, arrives after they are written and leaves them
+  # behind for renames that never ran. That is litter, not loss: no backup ever
+  # overwrites an older one, and moving the backups after the settings write to
+  # avoid it would recreate the original bug, an overwrite whose backup can
+  # still fail.)
 
   # Copy to a sibling temp file, then rename over the destination.
   #
@@ -1230,36 +1237,40 @@ if not cmd and sl_raw is not None and not isinstance(sl_raw, dict):
 sl_is_ours_file = os.environ.get("SL_IS_OURS") == "1"
 ours = refers_to(cmd, sl) and isinstance(sl_raw, dict) and sl_is_ours_file
 target = script_target(cmd)
-sl_broken = False
+# `ours` is the only passing state. Every other arm below describes gauges that
+# are not rendering, and 0.11.0 already rewrote their messages to say "re-run
+# ./install.sh to restore" — but left the exit at 0 whenever *any* command was
+# registered, a survivor of the era when a foreign status line was a setup to
+# preserve. An exit code that says healthy under a message that says broken is
+# the worse half of that contradiction: it is the half scripts read.
 if ours:
     print(f"  {G}ok{X}    status line is registered")
 elif cmd and refers_to(cmd, sl) and not sl_is_ours_file:
     # Registered at our path, but the file there is not the one we ship. The
     # installer no longer leaves anyone else's script here, so only a hand edit
     # after the fact reaches this — and re-running puts ccgauge's back.
-    print(f"  {Y}warn{X}  status line at {sl} is not ccgauge's script")
+    print(f"  {R}FAIL{X}  status line at {sl} is not ccgauge's script")
     print( "        re-run ./install.sh to restore it")
 elif cmd and target and not os.path.isabs(target):
     # Cannot be verified from here and will not resolve there: this process runs
     # wherever the installer was launched, Claude Code runs the status line from
     # the project directory. Resolving it against our own cwd is what let a
     # relative registration be reported as ours and rendered green.
-    print(f"  {Y}warn{X}  status line uses a relative path: {target}")
+    print(f"  {R}FAIL{X}  status line uses a relative path: {target}")
     print( "        Claude Code runs it from the project directory, not from here,")
     print( "        so it will usually render nothing — re-run ./install.sh to fix it")
 elif cmd and target and os.path.isabs(target) and not os.path.exists(target):
-    sl_broken = True
     print(f"  {R}FAIL{X}  status line names a file that does not exist: {target}")
     print( "        it renders nothing every turn — re-run ./install.sh to point it")
     print( "        back at ccgauge's status line")
 elif cmd:
-    print(f"  {Y}warn{X}  status line points elsewhere: {cmd}")
+    print(f"  {R}FAIL{X}  status line points elsewhere: {cmd}")
     print( "        the gauges are not rendering — re-run ./install.sh to restore them")
 else:
     print(f"  {R}FAIL{X}  no status line configured — the gauges have nowhere to render")
     print( "        re-run ./install.sh without --check")
 
-sys.exit(0 if registered and (ours or cmd) and not sl_broken else 1)
+sys.exit(0 if registered and ours else 1)
 PY
 ) && settings_ok=1 || settings_ok=0
 printf '%s\n' "$settings_report"
@@ -1365,7 +1376,21 @@ fi
 # Whether the stored hook command runs our script (which honours
 # CCGAUGE_USAGE_PY) or invokes usage.py directly, as install.ps1 registers it.
 # Only the former can be exercised against a stub.
-if printf '%s' "$hook_cmd_stored" | grep -qF "$HOOK_DST"; then
+#
+# Asked through python, not a bash grep, because the two spellings of one path
+# have to meet in the same world. On Git Bash the stored command holds the
+# Windows spelling (C:/...): the MSYS layer converts env values that look like
+# POSIX paths when it launches a native python, which is how the writer stored
+# that spelling in the first place. A bash `grep -qF "$HOOK_DST"` compared the
+# unconverted /c/... form against it, never matched, and sent every healthy
+# Git Bash install down the direct-invocation analysis — which FAILed it for
+# not invoking a Python. Passing $HOOK_DST through the same conversion the
+# writer used makes the comparison see what the writer saw; on a POSIX system
+# nothing is converted and this is the same fixed-string test as before.
+if HC="$hook_cmd_stored" TARGET="$HOOK_DST" python3 -c '
+import os, sys
+sys.exit(0 if os.environ["TARGET"] and os.environ["TARGET"] in os.environ["HC"] else 1)
+' 2>/dev/null; then
   hook_via_script=1
 else
   hook_via_script=0
@@ -1537,11 +1562,11 @@ fi
 # always emits ANSI escapes, so "is the output non-empty" can never fail, and
 # folding stderr in would make an error message look like a successful render.
 if [ -z "$sl_cmd_stored" ]; then
-  # Either nothing is configured (already FAILed by the settings check above) or
-  # the user's own status line is configured and we left it alone on purpose.
-  # Judging theirs by whether it draws ccgauge's glyphs would fail a setup the
-  # README explicitly supports.
-  ok "status line is not ccgauge's — not exercised"
+  # Nothing of ours to run. Every state that lands here — no registration, a
+  # registration pointing elsewhere, our path holding someone else's file — has
+  # already FAILed the settings check above, so the run is exiting 1 regardless;
+  # this line only records that the render check was skipped, not forgotten.
+  ok "status line render skipped — no ccgauge status line to exercise"
 elif ! sl_out=$(printf '%s' "$SAMPLE" | sh -c "$sl_cmd_stored" 2>"$sl_err"); then
   fail "status line failed to run — try: echo '{}' | sh -c $sl_cmd_stored"
   [ -s "$sl_err" ] && printf '        %s\n' "$(head -2 "$sl_err")"
