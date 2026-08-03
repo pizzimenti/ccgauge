@@ -570,6 +570,29 @@ PY
     printf '\033[0;31mccgauge: nothing was installed or changed.\033[0m\n' >&2
     exit 1
   fi
+  # Readable and well-formed is not the same as writable. The writer resolves
+  # symlinks and creates BOTH a timestamped backup and a temp file beside the
+  # real target, so settings.json symlinked into a read-only directory passes
+  # every check above and then fails after the copy -- reproduced: the status
+  # line was replaced and the run exited 1 at the backup step.
+  #
+  # Probe the resolved directory the way the writer will use it. realpath via
+  # python3 rather than `readlink -f`, which is GNU-only and silently yields
+  # nothing on a BSD userland.
+  settings_dir=$(SETTINGS="$SETTINGS" python3 -c \
+    'import os; print(os.path.dirname(os.path.realpath(os.environ["SETTINGS"])))' \
+    2>/dev/null) || settings_dir=""
+  [ -n "$settings_dir" ] || settings_dir=$(dirname "$SETTINGS")
+  settings_probe="$settings_dir/.ccgauge-write-probe.$$"
+  if ! (: > "$settings_probe") 2>/dev/null; then
+    fail "cannot write beside settings.json — the directory is not writable:"
+    printf '        %s\n' "$settings_dir"
+    printf '        the installer has to create a backup and a temp file there.\n'
+    echo
+    printf '\033[0;31mccgauge: nothing was installed or changed.\033[0m\n' >&2
+    exit 1
+  fi
+  rm -f "$settings_probe" 2>/dev/null || true
 
   # Back up anything at a destination that differs from what we are about to
   # write. No content marker: an earlier version keyed on "does the file contain
