@@ -640,7 +640,11 @@ PY
   # leaves nothing behind, destroying a working install, and if the clone *is*
   # the config dir then source and destination are the same file and the `rm`
   # deletes the source before it can be read.
-  install_file() {
+  # Staging only: produce the replacement beside its destination and stop there.
+  # Committing it is commit_file's job, and the two are separate so that every
+  # way copying can fail happens BEFORE settings.json is written -- see the
+  # ordering note above the phases below.
+  stage_file() {
     local src="$1" dst="$2" t mode sres dres
     # `readlink -f` is GNU; the BSD readlink on older macOS has no -f. With
     # stderr discarded both substitutions came back empty, compared equal, and
@@ -699,6 +703,19 @@ PY
       fail "could not make $dst executable"
       return 1
     fi
+  }
+
+  # Rename a staged temp into place. Separate from staging on purpose: staging
+  # has many ways to fail and must finish before settings.json is committed,
+  # while this is the step that actually changes what the user sees, and it waits
+  # until settings have landed.
+  commit_file() {
+    # Two statements, not one `local`: bash expands every word before the builtin
+    # runs, so `local dst="$1" t="$dst..."` reads the *outer* dst — unset, and
+    # fatal under `set -u`. bash -n does not catch it; only running it does.
+    local dst="$1" t
+    t="$dst.ccgauge-tmp.$$"
+    [ -e "$t" ] || return 0     # nothing staged: src and dst were the same file
     if ! mv -f "$t" "$dst" 2>/dev/null; then
       rm -f "$t"
       fail "could not replace $dst"
@@ -707,6 +724,41 @@ PY
   }
   # Sweep any temp file an interrupted run leaves behind (see CLEANUP above).
   CLEANUP+=("$USAGE_DST.ccgauge-tmp.$$" "$HOOK_DST.ccgauge-tmp.$$" "$STATUSLINE_DST.ccgauge-tmp.$$")
+
+  # Phase 1 of three: back up, then stage every replacement — all of it before
+  # settings.json is touched.
+  #
+  # Round 8 moved the settings write ahead of the copy so that a settings failure
+  # could not leave the status line already replaced. That fixed one order and
+  # broke the other: settings got committed naming files that then failed to
+  # install, so a directory sitting at statusline.sh produced a registration
+  # pointing at it, a failed backup, exit 1, and the message "nothing was
+  # overwritten" over a settings.json that had just been overwritten.
+  #
+  # Neither order is safe on its own, because the real requirement is that
+  # nothing commits until everything can. Backing up and staging first means the
+  # failures live here, where the machine is still untouched; the settings write
+  # comes second; the renames come last and are the only step that changes
+  # anything the user can see.
+  backed_up=1
+  backup_if_differs "$STATUSLINE_DST" "$HERE/statusline.sh" || backed_up=0
+  backup_if_differs "$HOOK_DST"       "$HERE/hooks/usage-line.sh" || backed_up=0
+  backup_if_differs "$USAGE_DST"      "$HERE/usage.py" || backed_up=0
+  if [ "$backed_up" -eq 0 ]; then
+    echo
+    printf '\033[0;31mccgauge: nothing was installed or changed.\033[0m\n' >&2
+    exit 1
+  fi
+
+  staged=1
+  stage_file "$HERE/usage.py"            "$USAGE_DST" || staged=0
+  stage_file "$HERE/hooks/usage-line.sh" "$HOOK_DST"  || staged=0
+  stage_file "$HERE/statusline.sh"       "$STATUSLINE_DST" || staged=0
+  if [ "$staged" -eq 0 ]; then
+    echo
+    printf '\033[0;31mccgauge: nothing was installed or changed.\033[0m\n' >&2
+    exit 1
+  fi
 
   # Register the UserPromptSubmit hook and the status line, backing up first.
   #
@@ -719,7 +771,7 @@ PY
   HOOK_PATH="$HOOK_DST" STATUSLINE_PATH="$STATUSLINE_DST" \
   USAGE_PATH="$USAGE_DST" \
   python3 - "$SETTINGS" <<'PY' || settings_write_failed=1
-import datetime, json, os, shlex, shutil, sys
+import datetime, json, os, shlex, shutil, sys, tempfile
 
 G, Y, R, X = "\033[0;32m", "\033[0;33m", "\033[0;31m", "\033[0m"
 # Resolve first. The atomic write replaces a *directory entry*, so a symlinked
@@ -961,43 +1013,40 @@ if 'replacing' in dir() and replacing:
 # so a settings.json deliberately restricted to 0600 would silently widen to
 # whatever the umask allows — a file that holds hook commands and can hold
 # tokens. Carry the mode across explicitly.
-tmp = path + ".tmp"
 try:
     mode = os.stat(path).st_mode & 0o7777
 except OSError:
     mode = None
+# A fresh inode under a random name, never a predictable path reopened.
+#
+# O_NOFOLLOW closed the symlink half of this and left the other half open: a
+# *hard* link planted at a fixed `<settings.json>.tmp` shares the victim's inode,
+# so O_TRUNC overwrites that file directly and refusing to follow links does not
+# help at all. mkstemp creates with O_EXCL|O_CREAT under a name nobody can
+# predict, so there is nothing to pre-place and no inode to share.
+#
+# It also retires the reasoning that O_EXCL had to stay off so a leftover temp
+# file could not block the next run. That was true of a fixed name; with a random
+# one there is no reuse, so leftovers are irrelevant rather than tolerated.
+#
 # Explicit utf-8: ensure_ascii=False above means `updated` can carry non-ASCII,
 # and the default encoding follows the ambient locale, which on a C/POSIX locale
 # raises UnicodeEncodeError mid-write.
-#
-# Guarded, like every other write in this script. The preflight now rejects a
-# blocked temp path before anything is copied, so reaching this is a race or a
-# permission change mid-run — but an unguarded open() here printed a raw
-# IsADirectoryError traceback, which is precisely the failure mode the defensive
-# parsing everywhere else exists to prevent.
-#
-# O_NOFOLLOW, because the temp name is fixed and predictable: a symlink planted
-# at `<settings.json>.tmp` would otherwise be followed and its target truncated,
-# which is a way to destroy an arbitrary writable file by running an installer.
-# O_EXCL is deliberately NOT set -- a leftover temp file from an interrupted run
-# is ordinary and must not block the next one -- so the guard is specifically
-# against following a link, not against the file existing.
-#
-# getattr: O_NOFOLLOW is POSIX and absent on Windows Python, where Git Bash runs
-# this. Degrading to 0 there loses the hardening but keeps the installer working,
-# and the failure it guards against needs a local attacker who can already write
-# into the config directory.
-flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
 try:
-    fd = os.open(tmp, flags, 0o600)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path) or ".",
+                               prefix=".ccgauge-settings-", suffix=".tmp")
 except OSError as exc:
-    print(f"  {R}FAIL{X}  could not create {tmp} ({exc})")
+    print(f"  {R}FAIL{X}  could not create a temp file beside {path} ({exc})")
     print( "        settings.json was not modified, and nothing was copied.")
     sys.exit(1)
 try:
     with os.fdopen(fd, "w", encoding="utf-8") as fh:
         fh.write(updated)
 except OSError as exc:
+    try:
+        os.unlink(tmp)
+    except OSError:
+        pass
     print(f"  {R}FAIL{X}  could not write {tmp} ({exc})")
     print( "        settings.json was not modified, and nothing was copied.")
     sys.exit(1)
@@ -1014,30 +1063,13 @@ PY
     exit 1
   fi
 
-  # Only now are the files replaced. settings.json is the part with a hundred
-  # ways to fail -- a dangling symlink, a read-only target, a blocked temp path,
-  # a shape the writer rejects -- and every one of them used to be discovered
-  # after the user's status line had already been overwritten. Copying last means
-  # a settings failure leaves the machine exactly as it was found, without the
-  # installer having to predict in advance which of those failures it might hit.
-  #
-  # The reverse order also fails cleanly: registrations point at $CONFIG_DIR
-  # paths, so if a copy fails after settings are written, whatever was already
-  # there keeps running and verification reports what is missing.
-  backed_up=1
-  backup_if_differs "$STATUSLINE_DST" "$HERE/statusline.sh" || backed_up=0
-  backup_if_differs "$HOOK_DST"       "$HERE/hooks/usage-line.sh" || backed_up=0
-  backup_if_differs "$USAGE_DST"      "$HERE/usage.py" || backed_up=0
-  if [ "$backed_up" -eq 0 ]; then
-    echo
-    printf '\033[0;31mccgauge: nothing was overwritten — see above.\033[0m\n' >&2
-    exit 1
-  fi
-
+  # Phase 3: commit. Everything is staged beside its destination and settings.json
+  # has landed, so this is a rename per file — the only step that changes what the
+  # user sees, and the last thing that can fail.
   copied=1
-  install_file "$HERE/usage.py"            "$USAGE_DST" || copied=0
-  install_file "$HERE/hooks/usage-line.sh" "$HOOK_DST"  || copied=0
-  install_file "$HERE/statusline.sh"       "$STATUSLINE_DST" || copied=0
+  commit_file "$USAGE_DST"      || copied=0
+  commit_file "$HOOK_DST"       || copied=0
+  commit_file "$STATUSLINE_DST" || copied=0
   if [ "$copied" -eq 0 ]; then
     echo
     printf '\033[0;31mccgauge: could not install the files — see above.\033[0m\n' >&2
