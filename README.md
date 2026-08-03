@@ -121,6 +121,19 @@ the `ls` above will not list it. The installer prints the full path when it make
 one (`backed up settings.json -> …`); use that. The status line backup is always
 in the config directory either way.
 
+**If your status line was a symlink**, `cp` from the backup will not bring the
+link back. The backup holds the file's *contents*, and the installer replaces a
+link with a regular file — it warns when it does (`… was a symlink to …`).
+Copying the backup therefore restores what the script said, not the connection
+to wherever it lived, so later edits in your dotfiles repo would stop reaching
+Claude Code. Recreate the link instead, and put the contents back at its target
+only if that file is gone:
+
+```sh
+cd "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+ln -sfn ~/dotfiles/claude/statusline.sh statusline.sh
+```
+
 The first line is the one that is easy to miss. If your status line already
 lived at `$CONFIG_DIR/statusline.sh`, then `settings.json` pointed at that path
 both before and after the install — so restoring `settings.json` alone changes

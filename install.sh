@@ -579,29 +579,16 @@ PY
   # Probe the resolved directory the way the writer will use it. realpath via
   # python3 rather than `readlink -f`, which is GNU-only and silently yields
   # nothing on a BSD userland.
-  settings_real=$(SETTINGS="$SETTINGS" python3 -c \
-    'import os; print(os.path.realpath(os.environ["SETTINGS"]))' \
-    2>/dev/null) || settings_real=""
-  [ -n "$settings_real" ] || settings_real="$SETTINGS"
-  # Probe the writer's ACTUAL temp path, not merely some file in the directory.
-  # The temp name is fixed (`<settings.json>.tmp`), so an interrupted run or a
-  # stray mkdir can leave a *directory* sitting on it: a generic probe elsewhere
-  # in the same directory then succeeds, the copy proceeds, and the writer dies
-  # on open(). Reproduced -- foreign status line replaced, then IsADirectoryError.
-  # Probing the real path is the only version of this check that tests what the
-  # writer will actually do.
-  settings_tmp="$settings_real.tmp"
-  if ! (: > "$settings_tmp") 2>/dev/null; then
-    fail "cannot write settings.json's temporary file:"
-    printf '        %s\n' "$settings_tmp"
-    printf '        something is in the way (a leftover directory?), or the\n'
-    printf '        directory is not writable. The installer needs to create\n'
-    printf '        both that file and a timestamped backup beside it.\n'
-    echo
-    printf '\033[0;31mccgauge: nothing was installed or changed.\033[0m\n' >&2
-    exit 1
-  fi
-  rm -f "$settings_tmp" 2>/dev/null || true
+  # No write probe here. Three rounds of review went into one, and each version
+  # was wrong in a new way: it tested the wrong path, then it followed a symlink
+  # at the right path and truncated an unrelated file, then it failed installs
+  # whose settings needed no write at all. A probe is a guess about what another
+  # piece of code will do, and keeping it honest means duplicating that code.
+  #
+  # It existed only because the copy ran first, so a settings failure left the
+  # status line already replaced. Doing the settings write first removes the
+  # reason for it: nothing is copied until settings.json has actually been
+  # updated, and every way that can fail now fails before any file is touched.
 
   # Back up anything at a destination that differs from what we are about to
   # write. No content marker: an earlier version keyed on "does the file contain
@@ -640,15 +627,9 @@ PY
   # What is *not* traded away is recoverability. Anything about to be overwritten
   # is backed up first, keyed on differing content, and no backup ever overwrites
   # an older one — so running this twice cannot destroy the copy that mattered.
-  backed_up=1
-  backup_if_differs "$STATUSLINE_DST" "$HERE/statusline.sh" || backed_up=0
-  backup_if_differs "$HOOK_DST"       "$HERE/hooks/usage-line.sh" || backed_up=0
-  backup_if_differs "$USAGE_DST"      "$HERE/usage.py" || backed_up=0
-  if [ "$backed_up" -eq 0 ]; then
-    echo
-    printf '\033[0;31mccgauge: nothing was overwritten — see above.\033[0m\n' >&2
-    exit 1
-  fi
+  # (The backups themselves run further down, immediately before the copy they
+  # protect — a settings failure that stops the copy must not leave .bak files
+  # for an overwrite that never happened.)
 
   # Copy to a sibling temp file, then rename over the destination.
   #
@@ -726,16 +707,6 @@ PY
   }
   # Sweep any temp file an interrupted run leaves behind (see CLEANUP above).
   CLEANUP+=("$USAGE_DST.ccgauge-tmp.$$" "$HOOK_DST.ccgauge-tmp.$$" "$STATUSLINE_DST.ccgauge-tmp.$$")
-  copied=1
-  install_file "$HERE/usage.py"            "$USAGE_DST" || copied=0
-  install_file "$HERE/hooks/usage-line.sh" "$HOOK_DST"  || copied=0
-  install_file "$HERE/statusline.sh"       "$STATUSLINE_DST" || copied=0
-  if [ "$copied" -eq 0 ]; then
-    echo
-    printf '\033[0;31mccgauge: could not install the files — see above.\033[0m\n' >&2
-    exit 1
-  fi
-  ok "copied usage.py, hooks/usage-line.sh, statusline.sh"
 
   # Register the UserPromptSubmit hook and the status line, backing up first.
   #
@@ -1004,12 +975,31 @@ except OSError:
 # permission change mid-run — but an unguarded open() here printed a raw
 # IsADirectoryError traceback, which is precisely the failure mode the defensive
 # parsing everywhere else exists to prevent.
+#
+# O_NOFOLLOW, because the temp name is fixed and predictable: a symlink planted
+# at `<settings.json>.tmp` would otherwise be followed and its target truncated,
+# which is a way to destroy an arbitrary writable file by running an installer.
+# O_EXCL is deliberately NOT set -- a leftover temp file from an interrupted run
+# is ordinary and must not block the next one -- so the guard is specifically
+# against following a link, not against the file existing.
+#
+# getattr: O_NOFOLLOW is POSIX and absent on Windows Python, where Git Bash runs
+# this. Degrading to 0 there loses the hardening but keeps the installer working,
+# and the failure it guards against needs a local attacker who can already write
+# into the config directory.
+flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
 try:
-    with open(tmp, "w", encoding="utf-8") as fh:
+    fd = os.open(tmp, flags, 0o600)
+except OSError as exc:
+    print(f"  {R}FAIL{X}  could not create {tmp} ({exc})")
+    print( "        settings.json was not modified, and nothing was copied.")
+    sys.exit(1)
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
         fh.write(updated)
 except OSError as exc:
     print(f"  {R}FAIL{X}  could not write {tmp} ({exc})")
-    print( "        settings.json was not modified.")
+    print( "        settings.json was not modified, and nothing was copied.")
     sys.exit(1)
 if mode is not None:
     try:
@@ -1020,9 +1010,40 @@ os.replace(tmp, path)
 PY
   if [ "${settings_write_failed:-0}" -eq 1 ]; then
     echo
-    printf '\033[0;31mccgauge: could not update settings.json — see above.\033[0m\n' >&2
+    printf '\033[0;31mccgauge: could not update settings.json — nothing was copied.\033[0m\n' >&2
     exit 1
   fi
+
+  # Only now are the files replaced. settings.json is the part with a hundred
+  # ways to fail -- a dangling symlink, a read-only target, a blocked temp path,
+  # a shape the writer rejects -- and every one of them used to be discovered
+  # after the user's status line had already been overwritten. Copying last means
+  # a settings failure leaves the machine exactly as it was found, without the
+  # installer having to predict in advance which of those failures it might hit.
+  #
+  # The reverse order also fails cleanly: registrations point at $CONFIG_DIR
+  # paths, so if a copy fails after settings are written, whatever was already
+  # there keeps running and verification reports what is missing.
+  backed_up=1
+  backup_if_differs "$STATUSLINE_DST" "$HERE/statusline.sh" || backed_up=0
+  backup_if_differs "$HOOK_DST"       "$HERE/hooks/usage-line.sh" || backed_up=0
+  backup_if_differs "$USAGE_DST"      "$HERE/usage.py" || backed_up=0
+  if [ "$backed_up" -eq 0 ]; then
+    echo
+    printf '\033[0;31mccgauge: nothing was overwritten — see above.\033[0m\n' >&2
+    exit 1
+  fi
+
+  copied=1
+  install_file "$HERE/usage.py"            "$USAGE_DST" || copied=0
+  install_file "$HERE/hooks/usage-line.sh" "$HOOK_DST"  || copied=0
+  install_file "$HERE/statusline.sh"       "$STATUSLINE_DST" || copied=0
+  if [ "$copied" -eq 0 ]; then
+    echo
+    printf '\033[0;31mccgauge: could not install the files — see above.\033[0m\n' >&2
+    exit 1
+  fi
+  ok "copied usage.py, hooks/usage-line.sh, statusline.sh"
 fi
 
 # --------------------------------------------------------------------------- #
