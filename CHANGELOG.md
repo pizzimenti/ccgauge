@@ -4,6 +4,48 @@ All notable changes to ccgauge are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); this project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.13.0] — 2026-08-03
+
+`--check`'s exit code now agrees with its own words. (0.12.0 is the Windows
+installer parity release, in flight on its own branch as this ships.)
+
+### Changed
+
+- **`--check` fails when the gauges are not rendering.** 0.11.0 rewrote the
+  status line verdicts so that every non-ccgauge registration reads as
+  something to restore with `./install.sh` — but left the exit at 0 whenever
+  *any* command was registered, a survivor of the era when a foreign status
+  line was a setup to preserve. A scripted `./install.sh --check && ...` read
+  "the gauges are not rendering" as healthy: the message said broken, the exit
+  code said fine, and the exit code is the half scripts see. The only passing
+  state now is ccgauge's registration pointing at ccgauge's file; the
+  points-elsewhere, relative-path, and hand-replaced-file verdicts print as
+  FAIL and exit 1, alongside the dead-target and nothing-registered verdicts
+  that already did. Pinned by `tests/test_check_semantics.sh`.
+
+### Fixed
+
+- **`--check` no longer fails a healthy Git Bash install over path spelling.**
+  The stored hook command holds the Windows spelling of the hook's path
+  (`C:/...`) because the MSYS layer converts env values that look like POSIX
+  paths when Git Bash launches a native python — which is exactly how the
+  writer stored it. The bash-side `grep` that classifies the hook command
+  compared the unconverted `/c/...` spelling against it, never matched, and
+  sent every healthy Git Bash install down the direct-invocation analysis,
+  which FAILed it for "not invoking a Python". The comparison now runs through
+  python, crossing the same conversion the writer crossed; on POSIX systems it
+  is the identical fixed-string test it always was.
+- **The settings preflight is fail-open in fact, not just in a comment.** The
+  comment promised that a python3-level failure in the preflight would fall
+  through to the writer's own validation; under `set -euo pipefail` it died
+  bare instead, with no summary. An `|| true` makes the behaviour match the
+  promise — the writer still rejects every bad shape independently.
+- **The backup-ordering comment stopped overclaiming.** It asserted that a
+  settings failure cannot leave `.bak` files behind; a phase-2 failure the
+  preflight cannot see (an unwritable resolved directory, a full disk) can.
+  The comment now says so, and says why that is litter rather than loss — no
+  backup ever overwrites an older one — instead of denying it.
+
 ## [0.11.0] — 2026-08-03
 
 An install is an install. ccgauge installs its own status line, every time, on
