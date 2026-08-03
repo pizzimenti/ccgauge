@@ -99,13 +99,21 @@ What you had is not lost. Anything about to be overwritten is backed up first â€
 ever overwrites an older one**, so running the installer twice cannot destroy
 the copy that mattered.
 
-Going back takes up to two steps, depending on where your script lived:
+Going back takes up to two steps, depending on where your script lived. List the
+backups first, newest at the top, then copy the ones you want by their real
+names:
 
 ```sh
 cd "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
-cp statusline.sh.<timestamp>.bak statusline.sh      # if yours was at this path
-cp settings.json.<timestamp>.bak settings.json      # if the registration changed
+ls -1t statusline.sh.*.bak settings.json.*.bak
+
+cp statusline.sh.20260803-004546.bak  statusline.sh   # if yours was at this path
+cp settings.json.20260803-004546.bak  settings.json   # if the registration changed
 ```
+
+Those two filenames are examples â€” substitute the ones `ls` printed. Don't type
+them with a placeholder in angle brackets: the shell reads `<...>` as a
+redirection, so the command fails instead of restoring anything.
 
 The first line is the one that is easy to miss. If your status line already
 lived at `$CONFIG_DIR/statusline.sh`, then `settings.json` pointed at that path
