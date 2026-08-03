@@ -515,9 +515,10 @@ if [ "$CHECK_ONLY" -eq 0 ]; then
   # looks at, under a message saying settings.json was not modified -- true, and
   # beside the point. Validate first; then nothing is touched unless everything
   # can proceed.
+  settings_absent=0
   if [ ! -f "$SETTINGS" ]; then
-    # `-f` is false for a dangling symlink too, and the redirect below would then
-    # fail under `set -e` with a bare shell error and no failure summary.
+    # `-f` is false for a dangling symlink too, and the redirect further down
+    # would then fail under `set -e` with a bare shell error and no summary.
     if [ -L "$SETTINGS" ]; then
       fail "settings.json is a symlink to a missing target:"
       printf '        %s -> %s\n' "$SETTINGS" "$(readlink "$SETTINGS")"
@@ -526,13 +527,13 @@ if [ "$CHECK_ONLY" -eq 0 ]; then
       printf '\033[0;31mccgauge: nothing was installed or changed.\033[0m\n' >&2
       exit 1
     fi
-    if ! printf '{\n  "hooks": {}\n}\n' > "$SETTINGS" 2>/dev/null; then
-      fail "could not create $SETTINGS (is $CONFIG_DIR writable?)"
-      echo
-      printf '\033[0;31mccgauge: nothing was installed or changed.\033[0m\n' >&2
-      exit 1
-    fi
-    ok "created $SETTINGS"
+    # Noted, not created. Creating it here meant a later staging failure -- a
+    # directory at statusline.sh, say -- exited 1 reporting "nothing was
+    # installed or changed" having just left a settings.json behind, which is
+    # exactly the all-or-nothing guarantee the phases exist to provide. It gets
+    # created in phase 2, once the replacements are staged and the run is
+    # committed to proceeding.
+    settings_absent=1
   fi
   # Check it here for every reason the writer would reject it, not just that it
   # parses. `[]`, `{"hooks": 5}` and `{"hooks": {"UserPromptSubmit": 5}}` are all
@@ -544,7 +545,11 @@ if [ "$CHECK_ONLY" -eq 0 ]; then
   # Fail-open if python3 itself misbehaves: it is a verified prerequisite by this
   # point, and the writer still rejects all of these independently. The gain here
   # is where the rejection happens, not whether it happens.
-  settings_problem=$(SETTINGS="$SETTINGS" python3 - <<'PY' 2>/dev/null
+  # Only when there is something to check. With settings.json absent the file is
+  # not created until phase 2, so reading it here would report "is not valid JSON
+  # (No such file)" and fail every fresh install.
+  if [ "$settings_absent" -eq 0 ]; then
+    settings_problem=$(SETTINGS="$SETTINGS" python3 - <<'PY' 2>/dev/null
 import json, os
 p = os.environ["SETTINGS"]
 try:
@@ -562,13 +567,14 @@ if isinstance(hooks, dict):
         print("hooks.UserPromptSubmit is not a list"); raise SystemExit(0)
 PY
 )
-  if [ -n "$settings_problem" ]; then
-    fail "settings.json $settings_problem"
-    printf '        %s\n' "$SETTINGS"
-    printf '        fix it by hand, or restore a settings.json.*.bak, then re-run.\n'
-    echo
-    printf '\033[0;31mccgauge: nothing was installed or changed.\033[0m\n' >&2
-    exit 1
+    if [ -n "$settings_problem" ]; then
+      fail "settings.json $settings_problem"
+      printf '        %s\n' "$SETTINGS"
+      printf '        fix it by hand, or restore a settings.json.*.bak, then re-run.\n'
+      echo
+      printf '\033[0;31mccgauge: nothing was installed or changed.\033[0m\n' >&2
+      exit 1
+    fi
   fi
   # Readable and well-formed is not the same as writable. The writer resolves
   # symlinks and creates BOTH a timestamped backup and a temp file beside the
@@ -758,6 +764,19 @@ PY
     echo
     printf '\033[0;31mccgauge: nothing was installed or changed.\033[0m\n' >&2
     exit 1
+  fi
+
+  # Phase 2. Everything is backed up and staged, so the run is going to proceed —
+  # which is the point at which creating a settings.json we were missing stops
+  # being something a later failure could strand.
+  if [ "$settings_absent" -eq 1 ]; then
+    if ! printf '{\n  "hooks": {}\n}\n' > "$SETTINGS" 2>/dev/null; then
+      fail "could not create $SETTINGS (is $CONFIG_DIR writable?)"
+      echo
+      printf '\033[0;31mccgauge: nothing was installed or changed.\033[0m\n' >&2
+      exit 1
+    fi
+    ok "created $SETTINGS"
   fi
 
   # Register the UserPromptSubmit hook and the status line, backing up first.

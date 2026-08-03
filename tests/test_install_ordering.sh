@@ -53,6 +53,10 @@ fresh() {  # dir -> config dir holding a foreign status line and valid settings
 
 sum() { md5sum "$1" 2>/dev/null | cut -d' ' -f1; }
 
+skip() {  # label reason
+    printf 'SKIP  %-38s %s\n' "$1" "$2"
+}
+
 # --- the happy path, and that it stays a no-op -------------------------------
 d="$WORK/ordinary"; fresh "$d"
 CLAUDE_CONFIG_DIR="$d" bash "$INST" >/dev/null 2>&1; rc=$?
@@ -113,21 +117,46 @@ done
 # Failing is right when a write is needed and impossible; failing when NO write
 # is needed blocks an update that would have worked, which a preflight probe
 # used to do.
-d="$WORK/ro"; fresh "$d"; ro="$WORK/ro-target"
-mkdir -p "$ro"; printf '{\n  "hooks": {}\n}\n' > "$ro/settings.json"
-rm -f "$d/settings.json"; ln -sfn "$ro/settings.json" "$d/settings.json"
-sl=$(sum "$d/statusline.sh")
-chmod 555 "$ro"
-CLAUDE_CONFIG_DIR="$d" bash "$INST" >/dev/null 2>&1; rc=$?
-[ "$(sum "$d/statusline.sh")" = "$sl" ] && ok=ok || ok=no
-report "read-only target, write needed" 1 "$rc" "status line kept" "$ok"
+# chmod 555 does not stop root, which is ordinary in a container -- the install
+# then succeeds where these cases expect it to be blocked, and the suite reports
+# a failure that says nothing about the code. Skipped explicitly rather than left
+# to fail confusingly.
+if [ "$(id -u)" -eq 0 ]; then
+    skip "read-only target, write needed" "running as root: chmod 555 does not apply"
+    skip "read-only target, no write needed" "running as root: chmod 555 does not apply"
+else
+    d="$WORK/ro"; fresh "$d"; ro="$WORK/ro-target"
+    mkdir -p "$ro"; printf '{\n  "hooks": {}\n}\n' > "$ro/settings.json"
+    rm -f "$d/settings.json"; ln -sfn "$ro/settings.json" "$d/settings.json"
+    sl=$(sum "$d/statusline.sh")
+    chmod 555 "$ro"
+    CLAUDE_CONFIG_DIR="$d" bash "$INST" >/dev/null 2>&1; rc=$?
+    [ "$(sum "$d/statusline.sh")" = "$sl" ] && ok=ok || ok=no
+    report "read-only target, write needed" 1 "$rc" "status line kept" "$ok"
 
-chmod 755 "$ro"
-CLAUDE_CONFIG_DIR="$d" bash "$INST" >/dev/null 2>&1     # prime: settings now correct
-chmod 555 "$ro"
+    chmod 755 "$ro"
+    CLAUDE_CONFIG_DIR="$d" bash "$INST" >/dev/null 2>&1     # prime: settings correct
+    chmod 555 "$ro"
+    CLAUDE_CONFIG_DIR="$d" bash "$INST" >/dev/null 2>&1; rc=$?
+    report "read-only target, no write needed" 0 "$rc" "install proceeds" ok
+    chmod 755 "$ro"
+fi
+
+# --- settings.json absent ----------------------------------------------------
+# The fresh-install path, which every case above misses because they all start
+# with a settings.json present. It creating that file during the preflight meant
+# a later staging failure exited 1 saying "nothing was installed or changed"
+# having just left one behind.
+d="$WORK/absent"; fresh "$d"; rm -f "$d/settings.json"
 CLAUDE_CONFIG_DIR="$d" bash "$INST" >/dev/null 2>&1; rc=$?
-report "read-only target, no write needed" 0 "$rc" "install proceeds" ok
-chmod 755 "$ro"
+[ -f "$d/settings.json" ] && ok=ok || ok=no
+report "no settings.json: fresh install" 0 "$rc" "settings created" "$ok"
+
+d="$WORK/absent2"; fresh "$d"; rm -f "$d/settings.json"
+rm -f "$d/statusline.sh"; mkdir -p "$d/statusline.sh"      # make staging fail
+CLAUDE_CONFIG_DIR="$d" bash "$INST" >/dev/null 2>&1; rc=$?
+[ -f "$d/settings.json" ] && ok=no || ok=ok
+report "no settings.json: staging fails" 1 "$rc" "settings NOT created" "$ok"
 
 echo
 if [ "$fail" -ne 0 ]; then
