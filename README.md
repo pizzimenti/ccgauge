@@ -97,7 +97,22 @@ worth trading for a flag.
 What you had is not lost. Anything about to be overwritten is backed up first —
 `settings.json` and the status line both, to timestamped files — and **no backup
 ever overwrites an older one**, so running the installer twice cannot destroy
-the copy that mattered. To go back, restore the newest `settings.json.*.bak`.
+the copy that mattered.
+
+Going back takes up to two steps, depending on where your script lived:
+
+```sh
+cd "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+cp statusline.sh.<timestamp>.bak statusline.sh      # if yours was at this path
+cp settings.json.<timestamp>.bak settings.json      # if the registration changed
+```
+
+The first line is the one that is easy to miss. If your status line already
+lived at `$CONFIG_DIR/statusline.sh`, then `settings.json` pointed at that path
+both before and after the install — so restoring `settings.json` alone changes
+nothing, and in that case the installer may not even have written a
+`settings.json` backup, because nothing in it changed. Your script is in
+`statusline.sh.<timestamp>.bak`, and that is the file that brings it back.
 
 If you want ccgauge's numbers inside a status line of your own, don't fight the
 installer for the slot — build your script, then point `statusLine` at it

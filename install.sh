@@ -839,10 +839,17 @@ if sl_raw is not None and sl is None:
     # and the user should see what it was rather than a bare "registered".
     current = json.dumps(sl_raw)
 
-if current and sl is not None and refers_to(current, sl_path):
+if current == statusline_cmd and sl is not None:
     print(f"  {G}ok{X}    status line already registered")
 else:
-    replacing = current
+    # Naming our path is not the same as invoking it the way we do. `python3
+    # <sl_path>` or `sh <sl_path>` refers_to() this file perfectly well, and the
+    # copy step above has just replaced whatever was there with a bash script —
+    # so preserving that spelling leaves a status line that fails on every
+    # render, and the installer's own check reports it. Once the file is
+    # unconditionally ours, the invocation has to be ours too.
+    respelled = bool(current) and sl is not None and refers_to(current, sl_path)
+    replacing = "" if respelled else current
     # Set only the keys we own, so any sibling key in an existing statusLine
     # block (padding, refreshInterval, whatever Claude Code adds next) survives.
     block = sl if sl is not None else {}
@@ -850,7 +857,11 @@ else:
     block["command"] = statusline_cmd
     cfg["statusLine"] = block
     changed = True
-    print(f"  {G}ok{X}    registered status line")
+    if respelled:
+        print(f"  {G}ok{X}    rewrote the status line to ccgauge's own invocation")
+        print(f"          was: {current}")
+    else:
+        print(f"  {G}ok{X}    registered status line")
 
 # Rewrite only when something actually changed, tracked as we went. Comparing
 # our own rendering against the file text instead means every settings.json that
