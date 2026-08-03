@@ -9,11 +9,16 @@
 # installer is the one place allowed to be loud.
 #
 #   ./install.sh              install (or update) and verify
-#   ./install.sh --statusline install, taking over an existing status line
 #   ./install.sh --check      verify an existing install; makes no network call
 #   ./install.sh --help
 #
 # Updating is the same command: `git pull && ./install.sh`.
+#
+# There is no flag for the status line. An install always installs ccgauge's,
+# so the gauges look the same on every machine and after every update — which is
+# the whole of what this tool is for. Anything it replaces is backed up first,
+# and no backup ever overwrites an older one, so running it twice cannot destroy
+# the copy that mattered.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -53,11 +58,9 @@ looks_like_python() {
 }
 
 CHECK_ONLY=0
-TAKE_STATUSLINE=0
 for arg in "$@"; do
   case "$arg" in
     --check)      CHECK_ONLY=1 ;;
-    --statusline) TAKE_STATUSLINE=1 ;;
     --help|-h)
       # Print the header block, stopping before `set -euo pipefail`.
       sed -n '2,/^set -euo/p' "${BASH_SOURCE[0]}" | sed '$d; s/^# \{0,1\}//'
@@ -501,6 +504,98 @@ if [ "$CHECK_ONLY" -eq 0 ]; then
     exit 1
   fi
 
+  # Settle settings.json BEFORE copying anything. Every reason this can fail --
+  # a dangling symlink, an unwritable directory, JSON we cannot parse -- used to
+  # be discovered after the three files had already been replaced, so the run
+  # exited non-zero having changed the install anyway.
+  #
+  # That was survivable while a foreign statusline.sh was skipped: a failed run
+  # left the user's own status line untouched. Now that it is always replaced,
+  # the same ordering means a failed install silently swaps the thing the user
+  # looks at, under a message saying settings.json was not modified -- true, and
+  # beside the point. Validate first; then nothing is touched unless everything
+  # can proceed.
+  settings_absent=0
+  if [ ! -f "$SETTINGS" ]; then
+    # `-f` is false for a dangling symlink too, and the redirect further down
+    # would then fail under `set -e` with a bare shell error and no summary.
+    if [ -L "$SETTINGS" ]; then
+      fail "settings.json is a symlink to a missing target:"
+      printf '        %s -> %s\n' "$SETTINGS" "$(readlink "$SETTINGS")"
+      printf '        create the target (or remove the link) and re-run.\n'
+      echo
+      printf '\033[0;31mccgauge: nothing was installed or changed.\033[0m\n' >&2
+      exit 1
+    fi
+    # Noted, not created. Creating it here meant a later staging failure -- a
+    # directory at statusline.sh, say -- exited 1 reporting "nothing was
+    # installed or changed" having just left a settings.json behind, which is
+    # exactly the all-or-nothing guarantee the phases exist to provide. It gets
+    # created in phase 2, once the replacements are staged and the run is
+    # committed to proceeding.
+    settings_absent=1
+  fi
+  # Check it here for every reason the writer would reject it, not just that it
+  # parses. `[]`, `{"hooks": 5}` and `{"hooks": {"UserPromptSubmit": 5}}` are all
+  # valid JSON and all fatal further down -- but only after the copy, which is
+  # the ordering this preflight exists to fix. Checking one of the writer's four
+  # reasons and calling the file validated just moves the same failure to a
+  # narrower set of inputs.
+  #
+  # Fail-open if python3 itself misbehaves: it is a verified prerequisite by this
+  # point, and the writer still rejects all of these independently. The gain here
+  # is where the rejection happens, not whether it happens.
+  # Only when there is something to check. With settings.json absent the file is
+  # not created until phase 2, so reading it here would report "is not valid JSON
+  # (No such file)" and fail every fresh install.
+  if [ "$settings_absent" -eq 0 ]; then
+    settings_problem=$(SETTINGS="$SETTINGS" python3 - <<'PY' 2>/dev/null
+import json, os
+p = os.environ["SETTINGS"]
+try:
+    cfg = json.load(open(p, encoding="utf-8-sig"))
+except Exception as exc:
+    print(f"is not valid JSON ({exc})"); raise SystemExit(0)
+if not isinstance(cfg, dict):
+    print("top level is not a JSON object"); raise SystemExit(0)
+hooks = cfg.get("hooks")
+if hooks is not None and not isinstance(hooks, dict):
+    print("'hooks' is not an object"); raise SystemExit(0)
+if isinstance(hooks, dict):
+    groups = hooks.get("UserPromptSubmit")
+    if groups is not None and not isinstance(groups, list):
+        print("hooks.UserPromptSubmit is not a list"); raise SystemExit(0)
+PY
+)
+    if [ -n "$settings_problem" ]; then
+      fail "settings.json $settings_problem"
+      printf '        %s\n' "$SETTINGS"
+      printf '        fix it by hand, or restore a settings.json.*.bak, then re-run.\n'
+      echo
+      printf '\033[0;31mccgauge: nothing was installed or changed.\033[0m\n' >&2
+      exit 1
+    fi
+  fi
+  # Readable and well-formed is not the same as writable. The writer resolves
+  # symlinks and creates BOTH a timestamped backup and a temp file beside the
+  # real target, so settings.json symlinked into a read-only directory passes
+  # every check above and then fails after the copy -- reproduced: the status
+  # line was replaced and the run exited 1 at the backup step.
+  #
+  # Probe the resolved directory the way the writer will use it. realpath via
+  # python3 rather than `readlink -f`, which is GNU-only and silently yields
+  # nothing on a BSD userland.
+  # No write probe here. Three rounds of review went into one, and each version
+  # was wrong in a new way: it tested the wrong path, then it followed a symlink
+  # at the right path and truncated an unrelated file, then it failed installs
+  # whose settings needed no write at all. A probe is a guess about what another
+  # piece of code will do, and keeping it honest means duplicating that code.
+  #
+  # It existed only because the copy ran first, so a settings failure left the
+  # status line already replaced. Doing the settings write first removes the
+  # reason for it: nothing is copied until settings.json has actually been
+  # updated, and every way that can fail now fails before any file is touched.
+
   # Back up anything at a destination that differs from what we are about to
   # write. No content marker: an earlier version keyed on "does the file contain
   # ccgauge's header comment", which reads a *customised copy of our own script*
@@ -528,34 +623,19 @@ if [ "$CHECK_ONLY" -eq 0 ]; then
     fi
     warn "existing $(basename "$dst") differs — backed it up to $(basename "$b")"
   }
-  # Decide whether statusline.sh may be written at all, BEFORE anything touches
-  # it. That path is not a name ccgauge owns — it is exactly where Claude Code's
-  # own /statusline command writes — so being there proves nothing about who put
-  # it there. Writing it unconditionally makes --statusline meaningless for
-  # everyone whose status line sits at the default path, and re-clobbers it on
-  # every documented `git pull && ./install.sh`.
+  # An install is an install: ccgauge always installs its own status line, and
+  # every run leaves the gauges looking the same on every machine. Earlier
+  # versions made that conditional — on a marker, on a flag — and the result was
+  # an installer whose visible output depended on state the user could not see,
+  # for a tool whose visible output is the point. Consistency is worth more than
+  # the conditional was.
   #
-  # The marker decides *whether to write*, never whether to back up: backups stay
-  # keyed on differing content, which is the honest test and the reason keying
-  # the backup on a marker was wrong. The second pattern recognises copies from
-  # ccgauge versions that shipped before the marker existed, so an update still
-  # lands on an install that predates it.
-  install_statusline=1
-  if [ -e "$STATUSLINE_DST" ] && [ "$TAKE_STATUSLINE" -eq 0 ] && ! statusline_is_ours; then
-    install_statusline=0
-  fi
-
-  backed_up=1
-  if [ "$install_statusline" -eq 1 ]; then
-    backup_if_differs "$STATUSLINE_DST" "$HERE/statusline.sh" || backed_up=0
-  fi
-  backup_if_differs "$HOOK_DST"       "$HERE/hooks/usage-line.sh" || backed_up=0
-  backup_if_differs "$USAGE_DST"      "$HERE/usage.py" || backed_up=0
-  if [ "$backed_up" -eq 0 ]; then
-    echo
-    printf '\033[0;31mccgauge: nothing was overwritten — see above.\033[0m\n' >&2
-    exit 1
-  fi
+  # What is *not* traded away is recoverability. Anything about to be overwritten
+  # is backed up first, keyed on differing content, and no backup ever overwrites
+  # an older one — so running this twice cannot destroy the copy that mattered.
+  # (The backups themselves run further down, immediately before the copy they
+  # protect — a settings failure that stops the copy must not leave .bak files
+  # for an overwrite that never happened.)
 
   # Copy to a sibling temp file, then rename over the destination.
   #
@@ -566,7 +646,11 @@ if [ "$CHECK_ONLY" -eq 0 ]; then
   # leaves nothing behind, destroying a working install, and if the clone *is*
   # the config dir then source and destination are the same file and the `rm`
   # deletes the source before it can be read.
-  install_file() {
+  # Staging only: produce the replacement beside its destination and stop there.
+  # Committing it is commit_file's job, and the two are separate so that every
+  # way copying can fail happens BEFORE settings.json is written -- see the
+  # ordering note above the phases below.
+  stage_file() {
     local src="$1" dst="$2" t mode sres dres
     # `readlink -f` is GNU; the BSD readlink on older macOS has no -f. With
     # stderr discarded both substitutions came back empty, compared equal, and
@@ -625,6 +709,19 @@ if [ "$CHECK_ONLY" -eq 0 ]; then
       fail "could not make $dst executable"
       return 1
     fi
+  }
+
+  # Rename a staged temp into place. Separate from staging on purpose: staging
+  # has many ways to fail and must finish before settings.json is committed,
+  # while this is the step that actually changes what the user sees, and it waits
+  # until settings have landed.
+  commit_file() {
+    # Two statements, not one `local`: bash expands every word before the builtin
+    # runs, so `local dst="$1" t="$dst..."` reads the *outer* dst — unset, and
+    # fatal under `set -u`. bash -n does not catch it; only running it does.
+    local dst="$1" t
+    t="$dst.ccgauge-tmp.$$"
+    [ -e "$t" ] || return 0     # nothing staged: src and dst were the same file
     if ! mv -f "$t" "$dst" 2>/dev/null; then
       rm -f "$t"
       fail "could not replace $dst"
@@ -633,41 +730,50 @@ if [ "$CHECK_ONLY" -eq 0 ]; then
   }
   # Sweep any temp file an interrupted run leaves behind (see CLEANUP above).
   CLEANUP+=("$USAGE_DST.ccgauge-tmp.$$" "$HOOK_DST.ccgauge-tmp.$$" "$STATUSLINE_DST.ccgauge-tmp.$$")
-  copied=1
-  install_file "$HERE/usage.py"            "$USAGE_DST" || copied=0
-  install_file "$HERE/hooks/usage-line.sh" "$HOOK_DST"  || copied=0
-  if [ "$install_statusline" -eq 1 ]; then
-    install_file "$HERE/statusline.sh"     "$STATUSLINE_DST" || copied=0
-  fi
-  if [ "$copied" -eq 0 ]; then
+
+  # Phase 1 of three: back up, then stage every replacement — all of it before
+  # settings.json is touched.
+  #
+  # Round 8 moved the settings write ahead of the copy so that a settings failure
+  # could not leave the status line already replaced. That fixed one order and
+  # broke the other: settings got committed naming files that then failed to
+  # install, so a directory sitting at statusline.sh produced a registration
+  # pointing at it, a failed backup, exit 1, and the message "nothing was
+  # overwritten" over a settings.json that had just been overwritten.
+  #
+  # Neither order is safe on its own, because the real requirement is that
+  # nothing commits until everything can. Backing up and staging first means the
+  # failures live here, where the machine is still untouched; the settings write
+  # comes second; the renames come last and are the only step that changes
+  # anything the user can see.
+  backed_up=1
+  backup_if_differs "$STATUSLINE_DST" "$HERE/statusline.sh" || backed_up=0
+  backup_if_differs "$HOOK_DST"       "$HERE/hooks/usage-line.sh" || backed_up=0
+  backup_if_differs "$USAGE_DST"      "$HERE/usage.py" || backed_up=0
+  if [ "$backed_up" -eq 0 ]; then
     echo
-    printf '\033[0;31mccgauge: could not install the files — see above.\033[0m\n' >&2
+    printf '\033[0;31mccgauge: nothing was installed or changed.\033[0m\n' >&2
     exit 1
   fi
-  if [ "$install_statusline" -eq 1 ]; then
-    ok "copied usage.py, hooks/usage-line.sh, statusline.sh"
-  else
-    ok "copied usage.py, hooks/usage-line.sh"
-    warn "$STATUSLINE_DST is not ccgauge's — left it exactly as it is"
-    warn "take it over with: ./install.sh --statusline"
+
+  staged=1
+  stage_file "$HERE/usage.py"            "$USAGE_DST" || staged=0
+  stage_file "$HERE/hooks/usage-line.sh" "$HOOK_DST"  || staged=0
+  stage_file "$HERE/statusline.sh"       "$STATUSLINE_DST" || staged=0
+  if [ "$staged" -eq 0 ]; then
+    echo
+    printf '\033[0;31mccgauge: nothing was installed or changed.\033[0m\n' >&2
+    exit 1
   fi
 
-  if [ ! -f "$SETTINGS" ]; then
-    # `-f` is false for a dangling symlink too, and the redirect would then fail
-    # under `set -e` with a bare shell error and no failure summary — after the
-    # three files have already been copied, leaving a half-install.
-    if [ -L "$SETTINGS" ]; then
-      fail "settings.json is a symlink to a missing target:"
-      printf '        %s -> %s\n' "$SETTINGS" "$(readlink "$SETTINGS")"
-      printf '        create the target (or remove the link) and re-run.\n'
-      echo
-      printf '\033[0;31mccgauge: settings.json was not modified.\033[0m\n' >&2
-      exit 1
-    fi
+  # Phase 2. Everything is backed up and staged, so the run is going to proceed —
+  # which is the point at which creating a settings.json we were missing stops
+  # being something a later failure could strand.
+  if [ "$settings_absent" -eq 1 ]; then
     if ! printf '{\n  "hooks": {}\n}\n' > "$SETTINGS" 2>/dev/null; then
       fail "could not create $SETTINGS (is $CONFIG_DIR writable?)"
       echo
-      printf '\033[0;31mccgauge: settings.json was not modified.\033[0m\n' >&2
+      printf '\033[0;31mccgauge: nothing was installed or changed.\033[0m\n' >&2
       exit 1
     fi
     ok "created $SETTINGS"
@@ -682,10 +788,9 @@ if [ "$CHECK_ONLY" -eq 0 ]; then
   # modified file — has destroyed the only copy of your original. Nothing here
   # ever overwrites an existing backup, and a no-op run leaves no litter.
   HOOK_PATH="$HOOK_DST" STATUSLINE_PATH="$STATUSLINE_DST" \
-  USAGE_PATH="$USAGE_DST" STATUSLINE_INSTALLED="$install_statusline" \
-  TAKE_STATUSLINE="$TAKE_STATUSLINE" \
+  USAGE_PATH="$USAGE_DST" \
   python3 - "$SETTINGS" <<'PY' || settings_write_failed=1
-import datetime, json, os, shlex, shutil, sys
+import datetime, json, os, shlex, shutil, sys, tempfile
 
 G, Y, R, X = "\033[0;32m", "\033[0;33m", "\033[0;31m", "\033[0m"
 # Resolve first. The atomic write replaces a *directory entry*, so a symlinked
@@ -703,11 +808,6 @@ sl_path = os.environ["STATUSLINE_PATH"]
 usage_py = os.environ.get("USAGE_PATH", "")
 hook_cmd = shlex.quote(hook_path)
 statusline_cmd = "bash " + shlex.quote(sl_path)
-take_statusline = os.environ.get("TAKE_STATUSLINE") == "1"
-# False when the file at sl_path is the user's own script, which we refused to
-# overwrite. Registering it anyway would point Claude Code's status line at
-# *their* script and then report it as ccgauge's.
-statusline_installed = os.environ.get("STATUSLINE_INSTALLED", "1") == "1"
 
 try:
     # utf-8-sig, not utf-8: a BOM is routine on Windows — Notepad and
@@ -841,80 +941,39 @@ else:
     changed = True
     print(f"  {G}ok{X}    registered UserPromptSubmit hook")
 
-# The status line is only taken over when it is absent, already ours, or the
-# user explicitly asked. Replacing a foreign one by default means the documented
-# "keep your own" setup cannot survive the documented `git pull && ./install.sh`
-# update — every update would silently clobber it again.
+# ccgauge always registers its own status line. There is no branch here for
+# leaving a foreign one alone, and no branch for repairing a registration that
+# names a file we removed, because neither state can survive the copy step above:
+# statusline.sh is always written, so this path always holds ccgauge's script and
+# always renders the same gauges on every machine.
+#
+# What that costs is a configuration someone else chose, and the answer to that
+# is not a flag — it is being loud and reversible. Whatever was registered is
+# named below, and the timestamped settings.json backup beside it never
+# overwrites an older one, so the copy that mattered survives a second run.
 sl_raw = cfg.get("statusLine")
 sl = sl_raw if isinstance(sl_raw, dict) else None
 current = (sl or {}).get("command")
 if sl_raw is not None and sl is None:
-    # A statusLine that is not an object is still the user's configuration.
-    # Coercing it to None makes the "leave a foreign one alone" branch
-    # unreachable and replaces it with no warning and no --statusline.
+    # A statusLine that is not an object is still a configuration being replaced,
+    # and the user should see what it was rather than a bare "registered".
     current = json.dumps(sl_raw)
-# A registration naming a file that is not there renders nothing, silently, on
-# every turn. Pre-0.9 installs wired statusline-snippet.sh, which this version
-# deletes, so the documented `git pull && ./install.sh` update walks straight
-# into it — and calling that "points elsewhere, fine if deliberate" hands the
-# user a dead status line over an install reported as verified.
-dead_target = ""
-if current and not (sl is not None and refers_to(current, sl_path)):
-    t = script_target(current)
-    if t and os.path.isabs(t) and not os.path.exists(t):
-        dead_target = t
-# Matched on the full path, never the basename alone. `statusline.sh` is a
-# conventional name, and a custom status line can be *temporarily* absent — an
-# unmounted home, a dotfiles checkout not yet cloned. Accepting any missing file
-# with a matching basename let an ordinary `git pull && ./install.sh` repoint
-# someone's own configuration permanently, without --statusline, which is the
-# exact clobbering this release exists to stop. Only the two paths ccgauge itself
-# has ever written qualify as a repair.
-_sl_dir = os.path.dirname(sl_path)
-was_ours = bool(dead_target) and os.path.normpath(dead_target) in (
-    os.path.normpath(os.path.join(_sl_dir, "statusline-snippet.sh")),
-    os.path.normpath(sl_path),
-)
 
-if current and sl is not None and refers_to(current, sl_path) and statusline_installed:
+# The whole block has to be right, not just the command. A canonical command
+# under a wrong `type` is not a working registration, and testing the command
+# alone reported it as one and skipped the rewrite that would have fixed it.
+if isinstance(sl, dict) and sl.get("type") == "command" \
+        and current == statusline_cmd:
     print(f"  {G}ok{X}    status line already registered")
-elif dead_target and was_ours and statusline_installed:
-    # A ccgauge status line from before the rename. Repointing it is a repair
-    # rather than a takeover: the file it names is gone, so there is no working
-    # configuration here to preserve.
-    replacing = current
-    block = sl if sl is not None else {}
-    block["type"] = "command"
-    block["command"] = statusline_cmd
-    cfg["statusLine"] = block
-    changed = True
-    print(f"  {G}ok{X}    repointed a ccgauge status line that named the removed "
-          f"{os.path.basename(dead_target)}")
-elif not statusline_installed:
-    # The file at sl_path is the user's own script, which the copy step refused to
-    # overwrite. Registering the path anyway would aim Claude Code at their
-    # script and then report it as ccgauge rendering correctly.
-    #
-    # This arm sits above the generic "leaving your existing status line alone"
-    # branch deliberately. When the registration already names sl_path and the
-    # file there is the user's own, both arms match — and the generic one printed
-    # the command back at them as though the path were the point, burying the
-    # thing they actually need to know and the flag that acts on it.
-    print(f"  {Y}warn{X}  not registering a status line: {sl_path} is your own script")
-    print( "          take it over with: ./install.sh --statusline")
-elif current and not take_statusline:
-    if dead_target:
-        print(f"  {Y}warn{X}  your status line names a file that does not exist:")
-        print(f"          {dead_target}")
-        print( "          it renders nothing at all — fix the path, or take it over with:")
-        print( "              ./install.sh --statusline")
-    else:
-        print(f"  {Y}warn{X}  leaving your existing status line alone:")
-        print(f"          {current}")
-        print( "          add ccgauge to it yourself (see the README), or take it over with:")
-        print( "              ./install.sh --statusline")
 else:
-    replacing = current
+    # Naming our path is not the same as invoking it the way we do. `python3
+    # <sl_path>` or `sh <sl_path>` refers_to() this file perfectly well, and the
+    # copy step above has just replaced whatever was there with a bash script —
+    # so preserving that spelling leaves a status line that fails on every
+    # render, and the installer's own check reports it. Once the file is
+    # unconditionally ours, the invocation has to be ours too.
+    respelled = bool(current) and sl is not None and refers_to(current, sl_path)
+    replacing = "" if respelled else current
     # Set only the keys we own, so any sibling key in an existing statusLine
     # block (padding, refreshInterval, whatever Claude Code adds next) survives.
     block = sl if sl is not None else {}
@@ -922,7 +981,11 @@ else:
     block["command"] = statusline_cmd
     cfg["statusLine"] = block
     changed = True
-    print(f"  {G}ok{X}    registered status line")
+    if respelled:
+        print(f"  {G}ok{X}    rewrote the status line to ccgauge's own invocation")
+        print(f"          was: {current}")
+    else:
+        print(f"  {G}ok{X}    registered status line")
 
 # Rewrite only when something actually changed, tracked as we went. Comparing
 # our own rendering against the file text instead means every settings.json that
@@ -969,16 +1032,43 @@ if 'replacing' in dir() and replacing:
 # so a settings.json deliberately restricted to 0600 would silently widen to
 # whatever the umask allows — a file that holds hook commands and can hold
 # tokens. Carry the mode across explicitly.
-tmp = path + ".tmp"
 try:
     mode = os.stat(path).st_mode & 0o7777
 except OSError:
     mode = None
+# A fresh inode under a random name, never a predictable path reopened.
+#
+# O_NOFOLLOW closed the symlink half of this and left the other half open: a
+# *hard* link planted at a fixed `<settings.json>.tmp` shares the victim's inode,
+# so O_TRUNC overwrites that file directly and refusing to follow links does not
+# help at all. mkstemp creates with O_EXCL|O_CREAT under a name nobody can
+# predict, so there is nothing to pre-place and no inode to share.
+#
+# It also retires the reasoning that O_EXCL had to stay off so a leftover temp
+# file could not block the next run. That was true of a fixed name; with a random
+# one there is no reuse, so leftovers are irrelevant rather than tolerated.
+#
 # Explicit utf-8: ensure_ascii=False above means `updated` can carry non-ASCII,
 # and the default encoding follows the ambient locale, which on a C/POSIX locale
 # raises UnicodeEncodeError mid-write.
-with open(tmp, "w", encoding="utf-8") as fh:
-    fh.write(updated)
+try:
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path) or ".",
+                               prefix=".ccgauge-settings-", suffix=".tmp")
+except OSError as exc:
+    print(f"  {R}FAIL{X}  could not create a temp file beside {path} ({exc})")
+    print( "        settings.json was not modified, and nothing was copied.")
+    sys.exit(1)
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(updated)
+except OSError as exc:
+    try:
+        os.unlink(tmp)
+    except OSError:
+        pass
+    print(f"  {R}FAIL{X}  could not write {tmp} ({exc})")
+    print( "        settings.json was not modified, and nothing was copied.")
+    sys.exit(1)
 if mode is not None:
     try:
         os.chmod(tmp, mode)
@@ -988,9 +1078,23 @@ os.replace(tmp, path)
 PY
   if [ "${settings_write_failed:-0}" -eq 1 ]; then
     echo
-    printf '\033[0;31mccgauge: could not update settings.json — see above.\033[0m\n' >&2
+    printf '\033[0;31mccgauge: could not update settings.json — nothing was copied.\033[0m\n' >&2
     exit 1
   fi
+
+  # Phase 3: commit. Everything is staged beside its destination and settings.json
+  # has landed, so this is a rename per file — the only step that changes what the
+  # user sees, and the last thing that can fail.
+  copied=1
+  commit_file "$USAGE_DST"      || copied=0
+  commit_file "$HOOK_DST"       || copied=0
+  commit_file "$STATUSLINE_DST" || copied=0
+  if [ "$copied" -eq 0 ]; then
+    echo
+    printf '\033[0;31mccgauge: could not install the files — see above.\033[0m\n' >&2
+    exit 1
+  fi
+  ok "copied usage.py, hooks/usage-line.sh, statusline.sh"
 fi
 
 # --------------------------------------------------------------------------- #
@@ -999,101 +1103,13 @@ fi
 echo
 echo "ccgauge: verifying"
 
-# Whether the configured status line runs $STATUSLINE_DST as its own first word,
-# with no interpreter in front. That is the only shape where the execute bit
-# decides anything: `bash <path>` reads the file and 0644 runs fine, but a bare
-# `<path>` is exec'd and dies with permission denied. Waiving the bit for every
-# foreign command regardless of form reports a status line that cannot run as
-# "installed and verified" -- the render check skips foreign scripts, so nothing
-# downstream catches it either.
-sl_needs_exec=$(SETTINGS="$SETTINGS" SL="$STATUSLINE_DST" python3 - <<'PY' 2>/dev/null || echo 1
-import json, os, shlex
-exec(os.environ["PY_PRELUDE"])   # effective_argv() — single definition, see the top
-
-# Safe by default. An earlier version asked "does this command invoke the file
-# directly?" and waived the execute bit whenever the answer looked like no --
-# which meant every invocation form it had not thought of became a silent pass.
-# `FOO=1 <path>`, `env <path>` and `bash -c '<path>'` all exec the script and die
-# with permission denied at 0644, and none of them puts the path first. Shell
-# invocation forms are not a closed set, so enumerating the dangerous ones is a
-# game you lose by one variant at a time.
-#
-# Inverted: the bit is required unless the command matches the one shape that
-# provably does not need it -- a known interpreter reading the file as an
-# argument. A false failure here says "chmod +x" to someone who did not strictly
-# need it, which is loud and harmless. A false pass reports a status line that
-# cannot run as "installed and verified".
-INTERPRETERS = ("bash", "sh", "zsh", "dash", "ksh", "ash",
-                "python", "python3", "py", "perl", "ruby", "node")
-
-cmd = ""
-try:
-    cfg = json.load(open(os.environ["SETTINGS"], encoding="utf-8-sig"))
-    block = cfg.get("statusLine") if isinstance(cfg, dict) else None
-    if isinstance(block, dict):
-        cmd = block.get("command") or ""
-    elif block is not None:
-        # A statusLine that is not an object is still a configured status line --
-        # the writer preserves it verbatim for exactly that reason. Reading it as
-        # "nothing is configured" would waive the execute bit on a file the value
-        # may name outright, which is the embedded-path hole wearing a different
-        # hat. str(), not json.dumps(): this is only ever substring-matched, and
-        # dumps() escapes the backslashes in a Windows path out of matching range.
-        cmd = str(block)
-except Exception:
-    cmd = ""
-
-# Resolved through the same routine the hook check uses. This block had its own
-# splitter and never learned about env at all, so `env bash <path>` -- which
-# reads the file and needs no execute bit -- saw words[0] == "env", matched no
-# interpreter, and failed a status line that works. `env <path>` still requires
-# the bit, because after resolution the path *is* argv[0].
-# Invalid quoting yields no words, so nothing can match the proven interpreter
-# shape and the substring test below decides: a command that mentions the path
-# keeps the execute-bit requirement. A command we cannot parse is not a command
-# we can prove safe.
-words = effective_argv(cmd) if _split_ok(cmd) else []
-
-sl = os.path.realpath(os.environ["SL"])
-idx = next((i for i, w in enumerate(words)
-            if w and os.path.isabs(w) and os.path.realpath(w) == sl), None)
-
-if idx is None:
-    # Not naming the file as a *word* is not the same as not naming it.
-    # `bash -c 'exec <path>'` keeps the whole script string as one shlex word, so
-    # nothing resolves to the target, yet the shell exec's it and exits 126 at
-    # 0644. Any mention of the path that did not match the proven shape above is
-    # treated as an invocation we do not understand, which means the bit stays
-    # required. Only a command that never mentions the file at all is moot.
-    needs = 1 if (os.environ["SL"] in cmd or sl in cmd) else 0
-elif idx == 0:
-    needs = 1          # the file is the command itself -- exec'd, needs +x
-else:
-    head = os.path.basename(words[0]).lower()
-    head = head[:-4] if head.endswith(".exe") else head
-    between = words[1:idx]
-    # -c takes a *script string*, not a file to read: `bash -c '<path>'` runs the
-    # path as a command and exec's it, so it needs the bit despite looking like
-    # an interpreter invocation.
-    needs = 0 if (head in INTERPRETERS
-                  and all(w.startswith("-") for w in between)
-                  and "-c" not in between) else 1
-print(needs)
-PY
-)
-
+# All three files are ours now, so the question is simply whether they are here
+# and runnable. The branch that waived the execute bit for a preserved foreign
+# status line went with the preservation: the installer no longer leaves a script
+# it did not write at this path, so there is nothing here whose mode is not ours
+# to set.
 for f in "$USAGE_DST" "$HOOK_DST" "$STATUSLINE_DST"; do
   if [ -x "$f" ]; then ok "present and executable: ${f#"$CONFIG_DIR"/}"
-  elif [ -f "$f" ] && [ "$f" = "$STATUSLINE_DST" ] && ! statusline_is_ours \
-       && [ "$sl_needs_exec" != "1" ]; then
-    # A preserved foreign status line that provably does not need the bit: either
-    # nothing names it, or a known interpreter reads it as an argument, where
-    # 0644 is an ordinary mode. Demanding +x on the one file we deliberately
-    # refused to touch turned a correct preservation into exit 1.
-    ok "present, left alone (your own script): ${f#"$CONFIG_DIR"/}"
-  elif [ -f "$f" ] && [ "$f" = "$STATUSLINE_DST" ] && [ "$sl_needs_exec" = "1" ]; then
-    fail "not executable: $f  (your statusLine command runs it directly —"
-    printf '        chmod +x it, or change the command to: bash %s)\n' "$f"
   elif [ -f "$f" ]; then fail "not executable: $f  (chmod +x it)"
   else fail "missing: $f  (re-run ./install.sh without --check)"
   fi
@@ -1215,15 +1231,14 @@ sl_is_ours_file = os.environ.get("SL_IS_OURS") == "1"
 ours = refers_to(cmd, sl) and isinstance(sl_raw, dict) and sl_is_ours_file
 target = script_target(cmd)
 sl_broken = False
-# A status line the writer deliberately declined to register, because the file at
-# our path belongs to the user. It is neither broken nor missing, and must not be
-# counted as either — see the arm below.
-sl_preserved = False
 if ours:
     print(f"  {G}ok{X}    status line is registered")
 elif cmd and refers_to(cmd, sl) and not sl_is_ours_file:
-    print(f"  {Y}warn{X}  status line at {sl} is your own script, not ccgauge's")
-    print( "        left alone on purpose — take it over with: ./install.sh --statusline")
+    # Registered at our path, but the file there is not the one we ship. The
+    # installer no longer leaves anyone else's script here, so only a hand edit
+    # after the fact reaches this — and re-running puts ccgauge's back.
+    print(f"  {Y}warn{X}  status line at {sl} is not ccgauge's script")
+    print( "        re-run ./install.sh to restore it")
 elif cmd and target and not os.path.isabs(target):
     # Cannot be verified from here and will not resolve there: this process runs
     # wherever the installer was launched, Claude Code runs the status line from
@@ -1235,28 +1250,16 @@ elif cmd and target and not os.path.isabs(target):
 elif cmd and target and os.path.isabs(target) and not os.path.exists(target):
     sl_broken = True
     print(f"  {R}FAIL{X}  status line names a file that does not exist: {target}")
-    print( "        it renders nothing every turn. Re-running the installer will not")
-    print( "        repair it — that path is not one ccgauge wrote, so it is left alone")
-    print( "        rather than repointed. Restore the file (an unmounted dotfiles")
-    print( "        checkout is the usual cause), fix the path in settings.json, or")
-    print( "        hand the status line to ccgauge with: ./install.sh --statusline")
+    print( "        it renders nothing every turn — re-run ./install.sh to point it")
+    print( "        back at ccgauge's status line")
 elif cmd:
     print(f"  {Y}warn{X}  status line points elsewhere: {cmd}")
-    print( "        (fine if that is deliberate — see the README)")
-elif not sl_is_ours_file and os.path.exists(sl):
-    # Nothing is registered *because* the file at our path is the user's own
-    # script and the writer refused to aim Claude Code at it. That is the
-    # preservation guarantee working, not a broken install — reporting it as
-    # "no status line configured" and exiting 1 turned the correct outcome into
-    # a failure, on every update, for exactly the users the guarantee is for.
-    sl_preserved = True
-    print(f"  {Y}warn{X}  no status line registered: {sl} is your own script")
-    print( "        left alone on purpose — take it over with: ./install.sh --statusline")
+    print( "        the gauges are not rendering — re-run ./install.sh to restore them")
 else:
     print(f"  {R}FAIL{X}  no status line configured — the gauges have nowhere to render")
     print( "        re-run ./install.sh without --check")
 
-sys.exit(0 if registered and (ours or cmd or sl_preserved) and not sl_broken else 1)
+sys.exit(0 if registered and (ours or cmd) and not sl_broken else 1)
 PY
 ) && settings_ok=1 || settings_ok=0
 printf '%s\n' "$settings_report"

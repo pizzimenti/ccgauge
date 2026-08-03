@@ -15,11 +15,15 @@
 # on every render.
 #
 # ccgauge-statusline-marker
-#   install.sh looks for this string to tell its own copy of this file from a
-#   status line you wrote yourself — $CONFIG_DIR/statusline.sh is where Claude
-#   Code's own /statusline command writes, so the name alone proves nothing.
-#   Keep the marker if you edit this file in place and updates will keep
-#   landing; delete it and the installer will leave the file alone from then on.
+#   Verification looks for this string to tell ccgauge's own copy of this file
+#   from something else sitting at the same path — $CONFIG_DIR/statusline.sh is
+#   also where Claude Code's own /statusline command writes, so the name alone
+#   proves nothing.
+#
+#   It no longer decides whether the file may be written: an install always
+#   installs this one. Edit this file in place and the next update overwrites
+#   you, keeping your copy beside it as a timestamped .bak. To run a status line
+#   of your own, put it somewhere else and point settings.json at that.
 
 input=$(cat)
 

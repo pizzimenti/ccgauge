@@ -79,7 +79,6 @@ the one place allowed to be loud.
 ```sh
 git pull && ./install.sh    # update — same command
 ./install.sh --check        # verify; makes no network call and mutates nothing
-./install.sh --statusline   # take over a status line you already have
 ```
 
 `--check` is safe to run repeatedly, including while you're diagnosing a
@@ -90,12 +89,62 @@ is how you extend one.
 
 #### If you already have a status line
 
-**The installer leaves it alone.** It tells you what it found and stops there,
-because replacing it by default would mean the documented "keep your own" setup
-couldn't survive the documented `git pull && ./install.sh` update — every update
-would silently clobber it again.
+**The installer replaces it.** An install is an install: ccgauge installs its
+own status line, so the gauges look the same on every machine and after every
+update. That consistency is the whole of what this tool is for, and it is not
+worth trading for a flag.
 
-Add ccgauge to your own status line with one call:
+What you had is not lost. Anything about to be overwritten is backed up first —
+`settings.json` and the status line both, to timestamped files — and **no backup
+ever overwrites an older one**, so running the installer twice cannot destroy
+the copy that mattered.
+
+Going back takes up to two steps, depending on where your script lived. List the
+backups first, newest at the top, then copy the ones you want by their real
+names:
+
+```sh
+cd "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+ls -1t statusline.sh.*.bak settings.json.*.bak
+
+cp statusline.sh.20260803-004546.bak  statusline.sh   # if yours was at this path
+cp settings.json.20260803-004546.bak  settings.json   # if the registration changed
+```
+
+Those two filenames are examples — substitute the ones `ls` printed. Don't type
+them with a placeholder in angle brackets: the shell reads `<...>` as a
+redirection, so the command fails instead of restoring anything.
+
+**If your `settings.json` is a symlink** — into a dotfiles repo, say — its backup
+is written beside the file the link points at, not in the config directory, so
+the `ls` above will not list it. The installer prints the full path when it makes
+one (`backed up settings.json -> …`); use that. The status line backup is always
+in the config directory either way.
+
+**If your status line was a symlink**, `cp` from the backup will not bring the
+link back. The backup holds the file's *contents*, and the installer replaces a
+link with a regular file — it warns when it does (`… was a symlink to …`).
+Copying the backup therefore restores what the script said, not the connection
+to wherever it lived, so later edits in your dotfiles repo would stop reaching
+Claude Code. Recreate the link instead, and put the contents back at its target
+only if that file is gone:
+
+```sh
+cd "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+ln -sfn ~/dotfiles/claude/statusline.sh statusline.sh
+```
+
+The first line is the one that is easy to miss. If your status line already
+lived at `$CONFIG_DIR/statusline.sh`, then `settings.json` pointed at that path
+both before and after the install — so restoring `settings.json` alone changes
+nothing, and in that case the installer may not even have written a
+`settings.json` backup, because nothing in it changed. Your script is in
+`statusline.sh.<timestamp>.bak`, and that is the file that brings it back.
+
+If you want ccgauge's numbers inside a status line of your own, don't fight the
+installer for the slot — build your script, then point `statusLine` at it
+yourself in `settings.json` and skip re-running the installer, or call ccgauge
+from it:
 
 ```sh
 python3 "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/usage.py" status
@@ -112,11 +161,6 @@ can pick up the git branch without a second process. `usage.py statusline` is
 the Windows one, rendering the same information in a single Python process
 because Windows has no bash to rely on. Use whichever matches your platform;
 `install.sh` and `install.ps1` each pick the right one for you.
-
-Or hand yours over with `./install.sh --statusline`, which backs up the previous
-`settings.json` to a timestamped file first. Backups are only written on a run
-that actually changes something, so nothing ever overwrites an earlier one and a
-repeat run leaves no litter — you can always get back to what you had.
 
 ### Windows 11
 
