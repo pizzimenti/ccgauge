@@ -4,7 +4,7 @@ All notable changes to ccgauge are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); this project uses
 [Semantic Versioning](https://semver.org/).
 
-## [0.11.0] — 2026-08-01
+## [0.11.0] — 2026-08-03
 
 An install is an install. ccgauge installs its own status line, every time, on
 every machine — so the gauges look the same everywhere and after every update.
