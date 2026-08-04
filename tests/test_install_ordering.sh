@@ -82,7 +82,12 @@ cfg["statusLine"] = {"type": "command", "command": "bash /home/me/mine.sh"}
 json.dump(cfg, open(p, "w"), indent=2)
 PY
 CLAUDE_CONFIG_DIR="$d" bash "$INST" >/dev/null 2>&1; rc=$?
-got=$(python3 -c "import json;print(json.load(open('$d/settings.json')).get('statusLine',{}).get('command'))")
+# The path rides in argv, not inside the -c string. An argument crosses the
+# MSYS path-conversion layer on Git Bash, so a native Windows python receives a
+# spelling it can open; a path interpolated into the code string does not, and
+# open() there fails on every Windows run — reporting an intact registration as
+# a FAIL that says nothing about the installer.
+got=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1])).get('statusLine',{}).get('command'))" "$d/settings.json")
 [ "$got" = "bash /home/me/mine.sh" ] && ok=ok || ok=no
 report "directory at statusline.sh" 1 "$rc" "registration kept" "$ok"
 
@@ -117,14 +122,20 @@ done
 # Failing is right when a write is needed and impossible; failing when NO write
 # is needed blocks an update that would have worked, which a preflight probe
 # used to do.
-# chmod 555 does not stop root, which is ordinary in a container -- the install
-# then succeeds where these cases expect it to be blocked, and the suite reports
-# a failure that says nothing about the code. Skipped explicitly rather than left
-# to fail confusingly.
-if [ "$(id -u)" -eq 0 ]; then
-    skip "read-only target, write needed" "running as root: chmod 555 does not apply"
-    skip "read-only target, no write needed" "running as root: chmod 555 does not apply"
+# chmod 555 does not bind everywhere: root ignores it (ordinary in a
+# container), and on NTFS under Git Bash it is close to a no-op. In both the
+# install succeeds where these cases expect it to be blocked, and the suite
+# reports a failure that says nothing about the code. Asked functionally --
+# does 555 actually stop a write here? -- rather than by enumerating the
+# environments where it does not, which is a list that grows one CI image at a
+# time. Skipped explicitly rather than left to fail confusingly.
+roprobe="$WORK/ro-probe"; mkdir -p "$roprobe"; chmod 555 "$roprobe"
+if touch "$roprobe/x" 2>/dev/null; then
+    chmod 755 "$roprobe"
+    skip "read-only target, write needed" "chmod 555 does not bind here (root, or NTFS)"
+    skip "read-only target, no write needed" "chmod 555 does not bind here (root, or NTFS)"
 else
+    chmod 755 "$roprobe"
     d="$WORK/ro"; fresh "$d"; ro="$WORK/ro-target"
     mkdir -p "$ro"; printf '{\n  "hooks": {}\n}\n' > "$ro/settings.json"
     rm -f "$d/settings.json"; ln -sfn "$ro/settings.json" "$d/settings.json"

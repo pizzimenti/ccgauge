@@ -1158,16 +1158,18 @@ def cmd_status(plain=False):
 
 
 def cmd_statusline():
-    """A complete status line: cwd, model, context bar, then the 5h/7d gauges.
+    """A complete status line: cwd, model and context bar, then the 5h/7d gauges.
 
-    The Python twin of statusline-snippet.sh, for platforms where bash isn't on
-    the render path — on Windows a PowerShell start-up per render would cost
-    more than the render itself, and this is one Python process instead of
-    python-inside-bash. Reads Claude Code's status-line JSON from stdin and
-    composes the same fragment the snippet does: blue cwd, dim model, a
+    Two lines, the same shape statusline.sh draws on POSIX. The Python twin of
+    that script, for platforms where bash isn't on the render path — on Windows
+    a PowerShell start-up per render would cost more than the render itself, and
+    this is one Python process instead of python-inside-bash. Reads Claude
+    Code's status-line JSON from stdin and composes blue cwd, dim model, a
     pace-less context bar (a context window has no clock), then cmd_status's
     self-contained colour fragment straight from the cache. Anything missing
     from the payload simply doesn't render — same contract as everything else.
+
+    (It used to name statusline-snippet.sh as its twin, which 0.9.0 deleted.)
     """
     payload = _hook_payload()
 
@@ -1191,6 +1193,14 @@ def cmd_statusline():
         # half away from zero) — reuse it so the number and the bar agree.
         pct = _cells(pct, 100)
         sys.stdout.write(f" ctx {_bar(pct)} {pct}%")
+    # Second line, exactly as statusline.sh does it (`printf "\n%s"`). This used
+    # to run the gauges onto the end of line one, because this function was
+    # written as the twin of statusline-snippet.sh -- which was a single line,
+    # and which 0.9.0 deleted when statusline.sh became two. The POSIX side got
+    # the second line; this never did, and nothing failed loudly enough to say
+    # so: the gauges still rendered, just in the wrong place, pushing themselves
+    # off the edge of a narrow terminal.
+    sys.stdout.write("\n")
     cmd_status()
 
 

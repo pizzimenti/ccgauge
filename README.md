@@ -156,11 +156,12 @@ yourself; it emits no ANSI at all. Either way,
 [`statusline.sh`](./statusline.sh) is a working reference.
 
 There are two complete status lines in the repo, for two different reasons.
-`statusline.sh` is the POSIX one this installer wires up: a shell script, so it
+`statusline.sh` is the POSIX one `install.sh` wires up: a shell script, so it
 can pick up the git branch without a second process. `usage.py statusline` is
-the Windows one, rendering the same information in a single Python process
-because Windows has no bash to rely on. Use whichever matches your platform;
-`install.sh` and `install.ps1` each pick the right one for you.
+the Windows one `install.ps1` wires up, rendering the same information in a
+single Python process because Windows has no bash to rely on. Each installer
+registers its own without being asked — the behaviour above is the same on both
+platforms.
 
 ### Windows 11
 
@@ -173,35 +174,43 @@ powershell -ExecutionPolicy Bypass -File install.ps1
 The installer finds a working Python 3 (`python`, `py -3`, or `python3`,
 each *run* to verify it — a stock Windows `python` is the Microsoft Store
 stub), copies `usage.py` into `%USERPROFILE%\.claude` (or
-`$env:CLAUDE_CONFIG_DIR`), and registers the hook as
+`$env:CLAUDE_CONFIG_DIR`), and registers **both halves**:
 
 ```text
-python "C:/Users/you/.claude/usage.py" hookline
+"hooks"      → python "C:/Users/you/.claude/usage.py" hookline
+"statusLine" → python "C:/Users/you/.claude/usage.py" statusline
 ```
 
 `hookline` is `line` plus the detached cache-warming `refresh` — everything
-`usage-line.sh` does, with no bash on the path. The forward slashes are
-deliberate: Claude Code on Windows runs hook and status-line commands through
-Git Bash when it is installed and PowerShell otherwise, and that spelling
-survives both. Re-running the installer is safe: an existing ccgauge
-registration — including a POSIX `usage-line.sh` one from a synced
-settings.json — is rewritten in place (and each replacement is printed)
-rather than accumulating duplicates. Then:
+`usage-line.sh` does, with no bash on the path. `statusline` is the Windows
+renderer: the same two lines `statusline.sh` draws on POSIX, in one Python
+process, because there is no bash here to lean on.
 
-1. **Verify:** `python "$env:USERPROFILE\.claude\usage.py" show` — substitute
-   the interpreter the installer said it picked (`py -3` on machines where
-   `python` is only the Store stub); its final output shows the exact command.
-2. **Status line:** `usage.py statusline` renders a complete example status
-   line — cwd, model, context bar, usage gauges — from the JSON Claude Code
-   pipes in, one Python process per render:
+The forward slashes are deliberate: Claude Code on Windows runs hook and
+status-line commands through Git Bash when it is installed and PowerShell
+otherwise, and that spelling survives both. Re-running the installer is safe: an
+existing ccgauge registration — including a POSIX `usage-line.sh` one from a
+synced settings.json — is rewritten in place (and each replacement is printed)
+rather than accumulating duplicates. As on Linux, the status line is always
+ccgauge's; `settings.json` is backed up to a timestamped file first, and only on
+a run that actually changes it. Then:
 
-   ```json
-   "statusLine": { "type": "command",
-                   "command": "python \"C:/Users/you/.claude/usage.py\" statusline" }
+1. **Verify:** the installer's closing output prints the exact command for your
+   machine — copy that. It already carries the interpreter it picked (`py -3` on
+   machines where `python` is only the Store stub) and the directory it actually
+   installed into, which is `$env:CLAUDE_CONFIG_DIR` when that is set:
+
+   ```powershell
+   $dir = if ($env:CLAUDE_CONFIG_DIR) { $env:CLAUDE_CONFIG_DIR } else { "$env:USERPROFILE\.claude" }
+   python "$dir\usage.py" show
    ```
+2. **Restart** Claude Code (or start a new session) so the hook and status line
+   load.
 
-   Already have a status line? Append a `usage.py status` call to it instead.
-3. **Restart** Claude Code (or start a new session) so the hook loads.
+Want to keep a status line of your own? Point `statusLine` back at it and append
+a `usage.py status` call to your script — that mode only reads the cache, so it
+is safe on every render. Re-running the installer takes the slot back, exactly
+as it does on Linux.
 
 The cache, the credentials discovery, and the history log live in
 `%USERPROFILE%\.claude` exactly as on Linux — Claude Code stores its OAuth

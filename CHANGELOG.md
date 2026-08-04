@@ -46,6 +46,43 @@ installer parity release, in flight on its own branch as this ships.)
   The comment now says so, and says why that is litter rather than loss — no
   backup ever overwrites an older one — instead of denying it.
 
+## [0.12.0] — 2026-08-03
+
+Brings the Windows installer up to the behaviour Linux has had for two releases.
+`install.ps1` was not carried along by 0.9.0's backup fix or 0.11.0's status-line
+decision, so the two installers had quietly diverged on both — found by running
+`install.ps1` on a real Windows box and reading what it printed.
+
+### Changed
+
+- **`install.ps1` registers the status line.** It previously registered only the
+  hook and *printed instructions* for the status line, so the visible half of
+  ccgauge was automatic on Linux and manual on Windows — a machine had gauges
+  only if someone read the closing message and hand-edited JSON. `usage.py
+  statusline` is now registered the same way `statusline.sh` is on POSIX, and
+  0.11.0's rule applies identically: an install installs ccgauge's status line.
+  The block is validated whole, so a canonical command carrying a wrong `type`
+  is corrected rather than reported as already-registered.
+
+### Fixed
+
+- **`install.ps1` no longer overwrites its own backup.** It copied
+  `settings.json` to a single fixed `settings.json.bak` with `-Force`, on
+  *every* run — including runs that changed nothing. That is exactly the trap
+  0.9.0 removed from `install.sh` and this script kept: install, notice your
+  status line changed, re-run the installer while working out how to undo it,
+  and the second run's backup — now a copy of the modified file — has destroyed
+  the only copy of your original. Observed doing precisely that on a run whose
+  own output said "leaving settings.json unchanged".
+
+  Backups are now timestamped, taken immediately before the write and only when
+  there is going to be one, and created with `"xb"` so an existing file is never
+  clobbered. Matching `install.sh` since 0.9.0.
+- **A `settings.json` containing non-ASCII survives a Windows install.** The
+  registrar wrote with `json.dump`'s default `ensure_ascii=True`, so an accented
+  word or an em dash anywhere in a file it only edits one key of came back
+  escaped. `ensure_ascii=False`, as `install.sh` has used since 0.10.0.
+
 ## [0.11.0] — 2026-08-03
 
 An install is an install. ccgauge installs its own status line, every time, on

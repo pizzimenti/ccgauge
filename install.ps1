@@ -1,9 +1,15 @@
 ﻿# ccgauge installer for native Windows.
 #
 # The PowerShell twin of install.sh: copies usage.py into your Claude Code
-# config directory and registers the UserPromptSubmit hook in settings.json
-# (idempotently, with a backup). The status line is left to you — the final
-# output shows the one-line wire-up.
+# config directory and registers BOTH the UserPromptSubmit hook and the status
+# line in settings.json, idempotently.
+#
+# The status line used to be left to the reader, with the closing message
+# showing the JSON to paste. That made the visible half of the tool optional on
+# Windows and automatic on Linux, for no reason a user could see — an install
+# is an install on both. `usage.py statusline` is the Windows renderer: one
+# Python process producing the same two lines statusline.sh produces on POSIX,
+# because there is no bash here to lean on.
 #
 # Usage:  powershell -ExecutionPolicy Bypass -File install.ps1
 #         (installs into %USERPROFILE%\.claude or $env:CLAUDE_CONFIG_DIR)
@@ -55,6 +61,11 @@ Write-Host 'ccgauge: copied usage.py'
 # double quotes, which both shells pass through.
 $usagePyFwd = $usagePyDest -replace '\\', '/'
 $hookCmd = "$pyToken `"$usagePyFwd`" hookline"
+# Same spelling rules as the hook, for the same reason: this string is handed to
+# whichever shell Claude Code picks. `statusline` is the Windows renderer --
+# cwd, model, context bar and the 5h/7d gauges in one Python process, since
+# there is no bash here to run statusline.sh.
+$statusLineCmd = "$pyToken `"$usagePyFwd`" statusline"
 
 if (-not (Test-Path -LiteralPath $settings)) {
     Set-Content -LiteralPath $settings -Value "{`n  `"hooks`": {}`n}" -Encoding Ascii
@@ -73,8 +84,16 @@ if ($LASTEXITCODE -ne 0) {
     throw "ccgauge: $settings is not valid JSON -- fix it (or delete it) and re-run. Nothing was changed."
 }
 
-Copy-Item -LiteralPath $settings "$settings.bak" -Force
-Write-Host 'ccgauge: backed up settings.json -> settings.json.bak'
+# No backup here. It used to be taken unconditionally, to a single fixed
+# settings.json.bak, with -Force -- which is the trap install.sh removed in
+# 0.9.0 and this script kept: install, notice your status line changed, re-run
+# the installer while working out how to undo it, and the second run's backup --
+# now a copy of the modified file -- has destroyed the only copy of the original.
+# A run that changes nothing overwrote it too, which is how the trap springs
+# without anyone doing anything wrong.
+#
+# The registrar below takes a timestamped one instead, immediately before it
+# writes and only if it is going to write, and never over an existing file.
 
 # Register the hook with Python, not ConvertTo-Json: PowerShell's JSON
 # round-trip re-wraps and re-types everything it touches (and 5.1 truncates
@@ -84,10 +103,11 @@ Write-Host 'ccgauge: backed up settings.json -> settings.json.bak'
 # usage-line.sh from a synced settings.json — replacements are printed, and
 # the write keeps LF line endings so a synced file doesn't churn to CRLF).
 $registerPy = @'
-import json, os, re, sys
+import datetime, json, os, re, sys
 
 path = sys.argv[1]
 hook_cmd = os.environ["CCGAUGE_HOOK_CMD"]
+status_cmd = os.environ["CCGAUGE_STATUS_CMD"]
 
 with open(path, encoding="utf-8-sig") as fh:
     cfg = json.load(fh)
@@ -111,31 +131,88 @@ if not isinstance(ups, list):
     print("ccgauge: settings.json hooks.UserPromptSubmit is not a list -- not touching it")
     sys.exit(1)
 
+changed = False
+notes = []
+
 existing = [h for g in ups if isinstance(g, dict)
             for h in (g.get("hooks") or [])
             if isinstance(h, dict) and OURS.search(str(h.get("command", "")))]
 
-def write():
-    with open(path, "w", encoding="utf-8", newline="\n") as fh:
-        json.dump(cfg, fh, indent=2)
-        fh.write("\n")
-
 stale = [h for h in existing if h.get("command") != hook_cmd]
 if existing and not stale:
-    print("ccgauge: hook already registered -- leaving settings.json unchanged")
+    notes.append("hook already registered")
 elif stale:
     for h in stale:
-        print("ccgauge: replacing ccgauge hook: " + str(h.get("command", "")))
+        notes.append("replacing ccgauge hook: " + str(h.get("command", "")))
         h["command"] = hook_cmd
-    write()
-    print("ccgauge: ccgauge hook is now: " + hook_cmd)
+    changed = True
+    notes.append("ccgauge hook is now: " + hook_cmd)
 else:
     ups.append({"hooks": [{"type": "command", "command": hook_cmd}]})
-    write()
-    print("ccgauge: registered UserPromptSubmit hook in settings.json")
+    changed = True
+    notes.append("registered UserPromptSubmit hook")
+
+# The status line, registered rather than described. The whole block has to be
+# right and not just the command: a canonical command under a wrong "type" is
+# not a working registration, and testing the command alone reports it as one.
+sl = cfg.get("statusLine")
+if isinstance(sl, dict) and sl.get("type") == "command" and sl.get("command") == status_cmd:
+    notes.append("status line already registered")
+else:
+    if sl is not None:
+        notes.append("replaced your status line: " + json.dumps(sl))
+    # Set only the keys we own, so a sibling key in an existing statusLine block
+    # survives; a non-object value is not a block to preserve, so start fresh.
+    block = sl if isinstance(sl, dict) else {}
+    block["type"] = "command"
+    block["command"] = status_cmd
+    cfg["statusLine"] = block
+    changed = True
+    notes.append("registered status line")
+
+# Nothing is announced until the outcome it describes is real. Printed up front,
+# a failed backup produced "registered status line" immediately followed by
+# "settings.json not modified" -- two lines contradicting each other, with the
+# true one second. The no-op path prints here because nothing downstream can
+# change it.
+if not changed:
+    for note in notes:
+        print("ccgauge: " + note)
+    print("ccgauge: settings.json already correct -- not rewritten")
+    sys.exit(0)
+
+# Timestamped, written only on a run that changes something, and never over an
+# existing file -- "xb" fails rather than clobbers. The old single fixed .bak,
+# copied on every run including no-op ones, is how a second run destroys the
+# copy of the original you were about to restore from.
+stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+backup = "%s.%s.bak" % (path, stamp)
+n = 1
+while os.path.exists(backup):
+    backup = "%s.%s-%d.bak" % (path, stamp, n)
+    n += 1
+try:
+    with open(path, "rb") as src, open(backup, "xb") as dst:
+        dst.write(src.read())
+except OSError as exc:
+    print("ccgauge: could not write a backup (%s) -- settings.json not modified" % exc)
+    sys.exit(1)
+print("ccgauge: backed up settings.json -> " + os.path.basename(backup))
+
+# ensure_ascii=False, matching install.sh: the default escapes every non-ASCII
+# character it passes through, so an accented word or an em dash anywhere in a
+# settings.json we are only editing one key of comes back mangled.
+with open(path, "w", encoding="utf-8", newline="\n") as fh:
+    json.dump(cfg, fh, indent=2, ensure_ascii=False)
+    fh.write("\n")
+
+# Now that it is true.
+for note in notes:
+    print("ccgauge: " + note)
 '@
 
 $env:CCGAUGE_HOOK_CMD = $hookCmd
+$env:CCGAUGE_STATUS_CMD = $statusLineCmd
 $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("ccgauge-register-" + [System.IO.Path]::GetRandomFileName() + ".py")
 Set-Content -LiteralPath $tmp -Value $registerPy -Encoding UTF8
 try {
@@ -144,20 +221,23 @@ try {
 } finally {
     Remove-Item -LiteralPath $tmp -ErrorAction SilentlyContinue
     Remove-Item Env:CCGAUGE_HOOK_CMD -ErrorAction SilentlyContinue
+    Remove-Item Env:CCGAUGE_STATUS_CMD -ErrorAction SilentlyContinue
 }
 
-$statusCmd = "$pyToken \`"$usagePyFwd\`" statusline"
 Write-Host @"
 
 ccgauge: done. Next steps:
   1. Verify it works:   $pyToken "$usagePyDest" show
-  2. Status line (optional) — add to $settings :
-       "statusLine": { "type": "command", "command": "$statusCmd" }
-     (usage.py statusline renders a whole example status line: cwd, model,
-     context bar, usage gauges. Already have a status line? Append
-     '$pyToken "$usagePyFwd" status' to it instead — it only reads the
-     cache, so it is safe on every render.)
-  3. Restart Claude Code (or start a new session) so the hook loads.
+  2. Restart Claude Code (or start a new session) so the hook and status line
+     load.
+
+Both halves are registered for you — the hook that feeds Claude your usage, and
+the status line that shows you the gauges. If you would rather keep a status
+line of your own, point statusLine back at it in
+$settings
+and append '$pyToken "$usagePyFwd" status' to your script to keep the numbers;
+that mode only reads the cache, so it is safe on every render. Re-running this
+installer will take the slot back — it always installs ccgauge's.
 
 The hook injects a [usage] line into the assistant's context each turn. At 95%
 of the session window it directs the assistant to queue work, compact, and set
