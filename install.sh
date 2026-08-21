@@ -479,10 +479,29 @@ esac
 # silent probe for it, guarded on $PLATFORM so `security` is never invoked off
 # Darwin. Best-effort by design: a locked or denied Keychain reads as "no
 # token", which is reported, never fatal.
+#
+# The macOS probe is bounded, and has to be. A Keychain item whose ACL does not
+# already trust `security` puts up a GUI dialog and blocks until it is answered
+# — which during an unattended install is never, and an installer that hangs
+# with no output is worse than one that reports no token. The bound is spelled
+# in python3 because stock macOS ships no timeout(1) (the one on this developer
+# machine came from Homebrew coreutils) and python3 is already a hard
+# prerequisite checked above. Same 5s usage.py puts on the same call.
 creds_available() {
   [ -r "$CONFIG_DIR/.credentials.json" ] && return 0
   if [ "$PLATFORM" = "Darwin" ]; then
-    security find-generic-password -s "Claude Code-credentials" -w >/dev/null 2>&1 && return 0
+    python3 - >/dev/null 2>&1 <<'PY' && return 0
+import subprocess, sys
+try:
+    r = subprocess.run(
+        ["security", "find-generic-password",
+         "-s", "Claude Code-credentials", "-w"],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=5)
+except Exception:
+    # Timed out (child already killed by run()), or security is missing.
+    sys.exit(1)
+sys.exit(0 if r.returncode == 0 and r.stdout.strip() else 1)
+PY
   fi
   return 1
 }

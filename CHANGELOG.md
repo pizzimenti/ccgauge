@@ -26,7 +26,12 @@ macOS is supported. It was never more than one missing token source.
   nothing further runs; on macOS it probes the Keychain. It replaces the two
   file-existence checks that gated the install-time cache warm and the final
   credentials report — the latter of which would otherwise have told a
-  logged-in Mac user to go log in.
+  logged-in Mac user to go log in. The probe is bounded at 5s, the same bound
+  `usage.py` puts on the same call: a Keychain item whose ACL does not already
+  trust `security` raises a GUI dialog and blocks until it is answered, which
+  during an unattended install is never, and an installer that hangs with no
+  output is worse than one that reports no token. The bound is spelled in
+  python3 because stock macOS ships no `timeout(1)`.
 
 ### Changed
 
