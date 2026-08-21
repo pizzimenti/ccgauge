@@ -4,6 +4,49 @@ All notable changes to ccgauge are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); this project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.14.0] — 2026-08-20
+
+macOS is supported. It was never more than one missing token source.
+
+### Added
+
+- **macOS support, via the login Keychain.** Claude Code stores its OAuth token
+  in the Keychain there rather than in `~/.claude/.credentials.json`, and
+  `install.sh` refused to run rather than leave a gauge that could never
+  populate. The refusal was sound; the premise that the gauge *could* never
+  populate was not. The Keychain item holds byte-for-byte the same JSON the
+  file does — `claudeAiOauth.accessToken`, `expiresAt` in milliseconds — so
+  nothing about parsing, caching, or rendering had to change. `usage.py` grew
+  one helper, `_read_cred_text()`, which tries the file on every platform and
+  falls through to `security find-generic-password` only on Darwin. That call
+  sits on the fetch path, which `load_token()` reaches from exactly one place,
+  so a status-line repaint never pays for it.
+- **`creds_available()` in `install.sh`**, the one place that knows where a
+  token lives. Off Darwin it is the `-r .credentials.json` test it replaces and
+  nothing further runs; on macOS it probes the Keychain. It replaces the two
+  file-existence checks that gated the install-time cache warm and the final
+  credentials report — the latter of which would otherwise have told a
+  logged-in Mac user to go log in.
+
+### Changed
+
+- **The macOS platform gate is gone.** `install.sh` reports macOS the way it
+  reports Linux, and the README's platform table now lists it as supported. The
+  three test suites went from 6 ordering failures and a `--check` suite that
+  could not prime, to all 16 checks passing on macOS; the gate was the only
+  thing failing them.
+
+### Compatibility
+
+- **Nothing changes on Linux or Windows.** `json.load(fh)` became
+  `json.loads(fh.read())`, which is its definition, with the `utf-8-sig`
+  handling preserved. Verified by differencing the old and new `load_token()`
+  over 14 credential-file states (valid nested and flat, BOM, corrupt, non-dict,
+  bad `expiresAt`, empty, missing, unreadable, non-ASCII) under simulated Linux
+  and Windows: no differences. `install.sh --check` output is byte-identical
+  across Linux, Windows and an untested platform, logged in and out, and
+  `security` is never invoked off Darwin.
+
 ## [0.15.0] — 2026-09-04
 
 Every weekly limit gets its own gauge, in `/usage`'s order.

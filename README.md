@@ -42,8 +42,8 @@ Requires Python 3.7+ (standard library only — no `pip install`, no `jq`).
 | | |
 | :-- | :-- |
 | **Linux** | Supported and developed on. Use `install.sh`. |
+| **macOS** | Supported. Use `install.sh` — the same one. Claude Code stores its OAuth token in the login Keychain rather than in `~/.claude/.credentials.json` ([docs](https://code.claude.com/docs/en/authentication)), so ccgauge reads it from there instead; see below. |
 | **Windows 11** | Supported natively. Use `install.ps1` — see below. |
-| **macOS** | **Not supported.** Claude Code stores its OAuth token in the macOS Keychain rather than in `~/.claude/.credentials.json` ([docs](https://code.claude.com/docs/en/authentication)), so there is no file for ccgauge to read and no amount of logging in will create one. Reading the Keychain isn't implemented, so `install.sh` refuses to run there rather than leaving a gauge that can never populate. |
 
 ### Linux
 
@@ -161,12 +161,36 @@ yourself; it emits no ANSI at all. Either way,
 [`statusline.sh`](./statusline.sh) is a working reference.
 
 There are two complete status lines in the repo, for two different reasons.
-`statusline.sh` is the POSIX one `install.sh` wires up: a shell script, so it
-can pick up the git branch without a second process. `usage.py statusline` is
-the Windows one `install.ps1` wires up, rendering the same information in a
-single Python process because Windows has no bash to rely on. Each installer
-registers its own without being asked — the behaviour above is the same on both
-platforms.
+`statusline.sh` is the POSIX one `install.sh` wires up on Linux and macOS: a
+shell script, so it can pick up the git branch without a second process.
+`usage.py statusline` is the Windows one `install.ps1` wires up, rendering the
+same information in a single Python process because Windows has no bash to rely
+on. Each installer registers its own without being asked — the behaviour above
+is the same on every platform.
+
+### macOS
+
+```sh
+git clone https://github.com/pizzimenti/ccgauge ~/Code/ccgauge
+cd ~/Code/ccgauge
+./install.sh
+```
+
+Identical to Linux — same installer, same three files, same `~/.claude`. The one
+difference is where the OAuth token comes from. macOS Claude Code keeps it in the
+login Keychain instead of `~/.claude/.credentials.json`, so `usage.py` reads it
+with:
+
+```sh
+security find-generic-password -s "Claude Code-credentials" -w
+```
+
+That runs only on the fetch path, never on a status-line repaint, so it costs
+nothing per render. The first read may raise a one-time "allow access" prompt
+depending on how the Keychain item's ACL was created; choosing **Always Allow**
+settles it. If the Keychain is locked or access is denied, ccgauge treats it the
+same as a missing token: the gauge line is omitted and the rest of the status
+line renders untouched.
 
 ### Windows 11
 
@@ -240,7 +264,8 @@ Three things make this work:
 
 - **The token** is read from `~/.claude/.credentials.json` →
   `.claudeAiOauth.accessToken` (on Windows the same file under
-  `%USERPROFILE%\.claude`). It's the OAuth token from your *browser* login,
+  `%USERPROFILE%\.claude`; on macOS the same JSON, out of the login Keychain
+  rather than a file). It's the OAuth token from your *browser* login,
   which carries the `user:profile` scope this endpoint requires. (A token from
   `claude setup-token` has only `user:inference` and will be rejected.)
 - **The `anthropic-beta` header** gates the OAuth API surface.
@@ -530,6 +555,7 @@ Every failure degrades to silence, never a crash or a stall:
 | Failure | Behavior |
 | --- | --- |
 | Token expired | Serve last read, marked `auth token unavailable`; Claude Code refreshes the token during normal use. |
+| Keychain locked or denied (macOS) | Reads as "no token": same path as an expired one, so the gauge is omitted and the rest of the status line is unaffected. |
 | 429 rate-limited | Honor `Retry-After` (else exponential backoff, capped 2h); serve last read, marked `rate-limited (429)` with the retry countdown; stop polling until it clears. |
 | Network down / timeout | Serve last read, marked `endpoint unreachable`. |
 | Endpoint removed / header rejected | Cache ages out; `line` prints "unavailable". |

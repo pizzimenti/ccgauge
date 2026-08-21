@@ -248,6 +248,34 @@ def _tilde(path):
     return path
 
 
+def _read_cred_text():
+    """Return the credentials JSON as text, or None when there is none to read.
+
+    Linux and Windows keep the token in a file; macOS keeps it in the login
+    Keychain, where there is no file to open. The file is tried first on every
+    platform, so off Darwin this is the old behaviour and the `security` branch
+    is unreachable.
+    """
+    try:
+        with open(CRED, encoding="utf-8-sig") as fh:
+            return fh.read()
+    except Exception:
+        pass
+    if sys.platform == "darwin":
+        # Best-effort. A locked or ACL-denied Keychain reads as "no token",
+        # which every caller already degrades on.
+        try:
+            r = subprocess.run(
+                ["security", "find-generic-password",
+                 "-s", "Claude Code-credentials", "-w"],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=5)
+            if r.returncode == 0 and r.stdout.strip():
+                return r.stdout.decode("utf-8", "replace")
+        except Exception:
+            pass
+    return None
+
+
 def load_token():
     """Return (access_token, expires_at_seconds) or (None, None).
 
@@ -256,9 +284,11 @@ def load_token():
     misread any non-ASCII byte and reject a hand-editor's BOM. Non-dict JSON
     anywhere in the shape degrades to "no token" like every other defect here.
     """
+    raw = _read_cred_text()
+    if raw is None:
+        return None, None
     try:
-        with open(CRED, encoding="utf-8-sig") as fh:
-            data = json.load(fh)
+        data = json.loads(raw)
     except Exception:
         return None, None
     if not isinstance(data, dict):
