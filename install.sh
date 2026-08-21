@@ -481,12 +481,20 @@ esac
 # token", which is reported, never fatal.
 #
 # The macOS probe is bounded, and has to be. A Keychain item whose ACL does not
-# already trust `security` puts up a GUI dialog and blocks until it is answered
-# — which during an unattended install is never, and an installer that hangs
-# with no output is worse than one that reports no token. The bound is spelled
-# in python3 because stock macOS ships no timeout(1) (the one on this developer
-# machine came from Homebrew coreutils) and python3 is already a hard
-# prerequisite checked above. Same 5s usage.py puts on the same call.
+# already trust `security` puts up an authorization dialog and blocks until it
+# is answered — which during an unattended install is never, and an installer
+# that hangs with no output is worse than one that reports no token. The bound
+# is spelled in python3 because stock macOS ships no timeout(1) (the one on the
+# developer's machine came from Homebrew coreutils, so reaching for it would
+# have worked there and hung on a clean Mac) and python3 is already a hard
+# prerequisite checked above.
+#
+# 30s, not the 5s usage.py uses for the same read. That asymmetry is the point:
+# usage.py runs on the hook's synchronous path, so its bound is your prompt
+# latency and must stay short. An install is the one moment a human is
+# definitionally present and watching, so it is the right place to spend real
+# seconds letting them answer the dialog — choosing Always Allow once retires it
+# for every later read.
 creds_available() {
   [ -r "$CONFIG_DIR/.credentials.json" ] && return 0
   if [ "$PLATFORM" = "Darwin" ]; then
@@ -496,7 +504,7 @@ try:
     r = subprocess.run(
         ["security", "find-generic-password",
          "-s", "Claude Code-credentials", "-w"],
-        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=5)
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=30)
 except Exception:
     # Timed out (child already killed by run()), or security is missing.
     sys.exit(1)

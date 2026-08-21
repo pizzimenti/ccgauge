@@ -26,12 +26,28 @@ macOS is supported. It was never more than one missing token source.
   nothing further runs; on macOS it probes the Keychain. It replaces the two
   file-existence checks that gated the install-time cache warm and the final
   credentials report — the latter of which would otherwise have told a
-  logged-in Mac user to go log in. The probe is bounded at 5s, the same bound
-  `usage.py` puts on the same call: a Keychain item whose ACL does not already
-  trust `security` raises a GUI dialog and blocks until it is answered, which
-  during an unattended install is never, and an installer that hangs with no
-  output is worse than one that reports no token. The bound is spelled in
-  python3 because stock macOS ships no `timeout(1)`.
+  logged-in Mac user to go log in. The probe is bounded at 30s: a Keychain item
+  whose ACL does not already trust `security` raises an authorization dialog and
+  blocks until it is answered, which during an unattended install is never, and
+  an installer that hangs with no output is worse than one that reports no
+  token. The bound is spelled in python3 because stock macOS ships no
+  `timeout(1)`.
+
+### Behaviour on an unanswered Keychain dialog
+
+- **The two bounds differ on purpose, and a timeout parks the next attempt.**
+  `usage.py` bounds its Keychain read at 5s (`KEYCHAIN_TIMEOUT`) because that
+  read sits on the hook's synchronous path and is therefore your prompt latency;
+  `install.sh` waits 30s because an install is the one moment a human is
+  definitionally present to answer the dialog, and choosing Always Allow once
+  retires it for every later read. Left there, though, the short bound would
+  have been worse than no bound: the "no token" path writes no cache, so nothing
+  advances the TTL clock, and every following prompt would raise the same dialog
+  and pay the same 5s stall, forever. A Keychain *timeout* — as distinct from a
+  plain missing token — now arms `ERROR_BACKOFF`, the mechanism that already
+  exists for exactly this loop, so the dialog can reappear at most once per
+  10 minutes instead of once per turn. Scoped to the timeout alone, so a missing
+  credentials file on Linux or Windows retries as cheaply as it always has.
 
 ### Changed
 
