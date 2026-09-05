@@ -4,7 +4,7 @@ All notable changes to ccgauge are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); this project uses
 [Semantic Versioning](https://semver.org/).
 
-## [0.14.0] — 2026-08-20
+## [0.16.0] — 2026-09-04
 
 macOS is supported. It was never more than one missing token source.
 
