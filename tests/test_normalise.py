@@ -108,23 +108,21 @@ FULL_BODY = {
 }
 
 # --- the shape as it is today -------------------------------------------------
-# The Fable row at 3% is the tightest weekly limit, so it is the 7d headline;
-# the all-models row at 2% is still there for `show`. `nimbus_quill` (0%) and
-# the codenamed nulls are ignored: only `limits` rows and the legacy windows
-# count, and the legacy windows only when the array has nothing for them.
+# The all-models row is the 7d headline; the Fable row rides beside it in
+# `weekly`, in payload order. `nimbus_quill` (0%) and the codenamed nulls are
+# ignored: only `limits` rows and the legacy windows count, and the legacy
+# windows only when the array has nothing for them.
 check("today's body", norm(FULL_BODY), {
     "five_hour_pct": 16, "five_hour_reset": S_RESET,
-    "seven_day_pct": 3, "seven_day_reset": F_RESET, "seven_day_scope": "Fable",
+    "seven_day_pct": 2, "seven_day_reset": W_RESET,
     "weekly": [{"label": None, "pct": 2, "reset": W_RESET},
                {"label": "Fable", "pct": 3, "reset": F_RESET}],
 })
-check("hook tag names the scope and the all-models figure",
-      u._scope_tag(norm(FULL_BODY)), " [Fable; all models 2%]")
 
 # --- the legacy shape ---------------------------------------------------------
 # What the endpoint returned when ccgauge was written: one object per window,
-# the scoped one without a reset. The same tightest-wins rule applies, and the
-# scoped row borrows the all-models reset so its countdown still draws.
+# the scoped one without a reset. The scoped row borrows the all-models reset
+# so its pace mark still draws.
 LEGACY = {
     "five_hour": {"utilization": 11.0, "resets_at": "5h"},
     "seven_day": {"utilization": 30.0, "resets_at": "7d"},
@@ -132,15 +130,13 @@ LEGACY = {
 }
 check("legacy body", norm(LEGACY), {
     "five_hour_pct": 11, "five_hour_reset": "5h",
-    "seven_day_pct": 40, "seven_day_reset": "7d", "seven_day_scope": "Opus",
+    "seven_day_pct": 30, "seven_day_reset": "7d",
     "weekly": [{"label": None, "pct": 30, "reset": "7d"},
                {"label": "Opus", "pct": 40, "reset": "7d"}],
 })
 check("legacy sonnet window is a row too",
       norm({"seven_day": {"utilization": 1}, "seven_day_sonnet": {"utilization": 9}})["weekly"],
       [{"label": None, "pct": 1, "reset": None}, {"label": "Sonnet", "pct": 9, "reset": None}])
-check("no tag for the all-models reading",
-      u._scope_tag(norm({"seven_day": {"utilization": 50}, "seven_day_opus": {"utilization": 20}})), "")
 
 # --- both shapes at once -----------------------------------------------------
 # Per window the array wins outright: the legacy `seven_day_opus` at 40% must
@@ -151,7 +147,7 @@ BOTH = dict(LEGACY, limits=[
 ])
 check("array wins over legacy", norm(BOTH), {
     "five_hour_pct": 5, "five_hour_reset": "s",
-    "seven_day_pct": 7, "seven_day_reset": "w", "seven_day_scope": None,
+    "seven_day_pct": 7, "seven_day_reset": "w",
     "weekly": [{"label": None, "pct": 7, "reset": "w"}],
 })
 check("legacy fills a window the array lacks", norm({
@@ -160,7 +156,7 @@ check("legacy fills a window the array lacks", norm({
 })["five_hour_pct"], 9)
 
 
-# --- which weekly limit is the headline --------------------------------------
+# --- the rows, and which one is the headline ---------------------------------
 def weekly(*rows):
     return norm({"limits": list(rows)})
 
@@ -173,18 +169,17 @@ def scoped(percent, scope, kind="weekly_scoped", reset="w"):
 ALL = {"kind": "weekly_all", "group": "weekly", "percent": 5, "resets_at": "w"}
 FABLE = {"model": {"display_name": "Fable", "id": None}, "surface": None}
 
-r = weekly(scoped(5, FABLE), ALL)
-check("tie keeps the all-models reading", r["seven_day_scope"], None)
+r = weekly(scoped(9, FABLE), ALL)
 check("all-models row leads whatever the payload order",
       [row["label"] for row in r["weekly"]], [None, "Fable"])
-check("scoped ahead by one wins", weekly(ALL, scoped(6, FABLE))["seven_day_scope"], "Fable")
+check("headline is the all-models row even when a scoped one is higher",
+      r["seven_day_pct"], 5)
 r = weekly(ALL, scoped(9, {"model": {"display_name": "Opus 5"}}),
            scoped(4, {"model": {"display_name": "Sonnet 5"}}))
-check("highest of several scoped rows",
-      (r["seven_day_pct"], r["seven_day_scope"]), (9, "Opus 5"))
-check("every row is kept for show", [row["label"] for row in r["weekly"]],
+check("scoped rows keep payload order", [row["label"] for row in r["weekly"]],
       [None, "Opus 5", "Sonnet 5"])
-check("scoped row alone is the headline", weekly(scoped(8, FABLE))["seven_day_scope"], "Fable")
+check("a body with only scoped limits still fills the headline",
+      weekly(scoped(8, FABLE))["seven_day_pct"], 8)
 
 
 # --- labels come from the payload --------------------------------------------
@@ -204,7 +199,7 @@ check("scoped with an empty scope", label_of(scoped(1, {})), "scoped")
 
 # --- malformed bodies never raise, and never invent a reading -----------------
 EMPTY = {"five_hour_pct": None, "five_hour_reset": None, "seven_day_pct": None,
-         "seven_day_reset": None, "seven_day_scope": None, "weekly": []}
+         "seven_day_reset": None, "weekly": []}
 check("empty body", norm({}), EMPTY)
 check("body not a dict", norm(None), EMPTY)
 check("body a string", norm("not json"), EMPTY)
@@ -237,6 +232,24 @@ check("None is no reading", u._round_pct(None), None)
 check("legacy utilization rounds the same way", u._pct({"utilization": 2.5}), 3)
 check("array percent rounds the same way",
       norm({"limits": [{"kind": "session", "percent": 2.5}]})["five_hour_pct"], 3)
+
+# --- what the readers draw ----------------------------------------------------
+# The status line, the hook line and `show` all walk _weekly_rows and label
+# each row with _weekly_label, so these two are what the user actually sees.
+check("a gauge per weekly row, all-models first",
+      [u._weekly_label(r) for r in u._weekly_rows(norm(FULL_BODY))], ["7d", "7d·Fable"])
+check("scoped label is the payload's name", u._weekly_label({"label": "Opus 5"}), "7d·Opus 5")
+check("all-models label is plain 7d", u._weekly_label({"label": None}), "7d")
+check("an old cache (no `weekly`) still yields its headline row",
+      u._weekly_rows({"seven_day_pct": 4, "seven_day_reset": "w"}),
+      [{"label": None, "pct": 4, "reset": "w"}])
+check("a row without a usable percentage is not drawn",
+      u._weekly_rows({"weekly": [{"label": "x", "pct": "??"}, {"label": None, "pct": 1}]}),
+      [{"label": None, "pct": 1}])
+check("no weekly data draws nothing", u._weekly_rows({}), [])
+check("no reset means no clause", u._resets_clause(None), "")
+check("a garbage reset means no clause", u._resets_clause("not a time"), "")
+check("a reset in the past reads as now", u._resets_clause("2000-01-01T00:00:00Z"), " (resets now)")
 
 if failures:
     print(f"FAILED ({len(failures)}):", file=sys.stderr)

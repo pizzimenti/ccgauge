@@ -650,13 +650,10 @@ def normalise(body):
     fills in only where the array has no row, so a body with both is never
     counted twice.
 
-    The cache keys every reader depends on keep their names, but `seven_day_*`
-    now describes the *tightest* weekly limit — the highest percentage across
-    the all-models row and every scoped one — because that is the wall you hit
-    first, and a gauge showing the looser figure while a scoped limit ran
-    ahead would fail at the one thing it is for. `seven_day_scope` says which
-    (None for all models; a tie goes to all models, so a scope appears only
-    when it changes the reading) and `weekly` carries every row, for `show`.
+    The cache keys every reader depends on keep their names and meanings:
+    `seven_day_*` is the all-models weekly limit. `weekly` carries every
+    weekly row — the all-models one first, then each scoped one — and the
+    readers draw a gauge per row, in that order, the way `/usage` lists them.
     """
     body = body if isinstance(body, dict) else {}
     session, weekly = _limits(body)
@@ -675,16 +672,16 @@ def normalise(body):
     for r in weekly:
         if r["reset"] is None:
             r["reset"] = shared
-    tightest = None
-    for r in weekly:  # all-models leads, so a tie keeps the unscoped reading
-        if tightest is None or r["pct"] > tightest["pct"]:
-            tightest = r
+    # The headline keys keep the all-models reading — what `7d` has always
+    # meant — falling back to the first row when the array has no unscoped
+    # one, so a body with only scoped limits still populates them.
+    head = next((r for r in weekly if r["label"] is None),
+                weekly[0] if weekly else None)
     return {
         "five_hour_pct": session[0],
         "five_hour_reset": session[1],
-        "seven_day_pct": tightest["pct"] if tightest else None,
-        "seven_day_reset": tightest["reset"] if tightest else None,
-        "seven_day_scope": tightest["label"] if tightest else None,
+        "seven_day_pct": head["pct"] if head else None,
+        "seven_day_reset": head["reset"] if head else None,
         "weekly": weekly,
         "fetched_at": _now(),
     }
@@ -763,22 +760,38 @@ def fmt_reset(iso):
     return f"in {h}h {m}m" if h else f"in {m}m"
 
 
-def _scope_tag(c):
-    """' [Fable; all models 2%]' when the cached 7d reading is a scoped limit.
+def _weekly_rows(c):
+    """The cache's weekly rows with a usable percentage, all-models first.
 
-    Empty when it is the all-models reading, which needs no qualifying. The
-    all-models figure rides along so the reader can see whether the scoped
-    limit is the only thing that's tight; a bare "[Fable]" leaves the obvious
-    question — would another model have room? — unanswerable.
+    A cache written before `weekly` existed carries only the headline; that
+    becomes the one row, so nothing blanks across the upgrade.
     """
-    scope = c.get("seven_day_scope")
-    if not isinstance(scope, str) or not scope:
-        return ""
-    for r in c.get("weekly") or []:
-        if (isinstance(r, dict) and r.get("label") is None
-                and _finite(r.get("pct")) is not None):
-            return f" [{scope}; all models {r['pct']}%]"
-    return f" [{scope}]"
+    rows = [r for r in (c.get("weekly") or [])
+            if isinstance(r, dict) and _finite(r.get("pct")) is not None]
+    if not rows and _finite(c.get("seven_day_pct")) is not None:
+        rows = [{"label": None, "pct": c.get("seven_day_pct"),
+                 "reset": c.get("seven_day_reset")}]
+    return rows
+
+
+def _weekly_label(row):
+    """'7d' for the all-models weekly limit, '7d·Fable' for a scoped one.
+
+    The scoped name is the payload's, so the label tracks whatever the endpoint
+    scopes to; plain '7d' means all models, as it always has.
+    """
+    label = row.get("label")
+    return f"7d·{label}" if isinstance(label, str) and label else "7d"
+
+
+def _resets_clause(iso):
+    """' (resets in 4h 1m)', or '' when there is no reset to name.
+
+    An untouched window comes with no reset time at all, and 'resets ' with
+    nothing after it is worse than silence — the assistant reads this line.
+    """
+    when = fmt_reset(iso)
+    return f" (resets {when})" if when else ""
 
 
 def fmt_clock(epoch):
@@ -962,15 +975,14 @@ def refresh(force=False, outcome=None):
                 # The resets travel with the percentages so the log can tell a
                 # window that turned over from a reading that merely fell: a
                 # weekly reset early, 37% one day and 2% the next, was
-                # indistinguishable from bad data without them. The scope says
-                # which weekly limit the 7d figure tracks when it isn't the
-                # all-models one (None, hence dropped, when it is).
+                # indistinguishable from bad data without them. `weekly` is
+                # every weekly row, so the scoped limits are on record too.
                 log_event("fetch",
                           five_hour_pct=data.get("five_hour_pct"),
                           five_hour_reset=data.get("five_hour_reset"),
                           seven_day_pct=data.get("seven_day_pct"),
                           seven_day_reset=data.get("seven_day_reset"),
-                          seven_day_scope=data.get("seven_day_scope"))
+                          weekly=data.get("weekly"))
             clear_cooldown()
             clear_error_backoff()
             _out("ok")
@@ -1045,29 +1057,28 @@ def cmd_line():
         log_event("prompt", cwd=cwd, session_id=session)
         print("[usage] unavailable")
         return
-    r5 = fmt_reset(c.get("five_hour_reset"))
-    r7 = fmt_reset(c.get("seven_day_reset"))
+    r5 = _resets_clause(c.get("five_hour_reset"))
     # A non-numeric fetched_at (a hand-damaged cache) counts as stale-with-
     # unknown-age rather than raising: the percentages beside it may still be
     # real, and one bad field must not void the whole line.
     fa = c.get("fetched_at")
     age = int(_now() - fa) if isinstance(fa, (int, float)) else None
-    log_event("prompt", five_hour_pct=p5, seven_day_pct=p7,
-              seven_day_scope=c.get("seven_day_scope"), cache_age_s=age,
+    log_event("prompt", five_hour_pct=p5, seven_day_pct=p7, cache_age_s=age,
               cwd=cwd, session_id=session)
     stale = age is None or age > STALE_SECONDS
     parts = []
     if p5 is not None:
         parts.append(f"session(5h) last-known {p5}% (NOT live)" if stale
-                     else f"session(5h) {p5}% used (resets {r5})")
-    if p7 is not None:
-        # Name the limit when the 7d figure is a model-scoped one, with the
-        # all-models figure beside it: the assistant reading this line can then
-        # tell whether another model would have more room — which a bare
-        # percentage, however accurate, cannot say.
-        tag = _scope_tag(c)
-        parts.append(f"week(7d) last-known {p7}%{tag} (NOT live)" if stale
-                     else f"week(7d) {p7}% used{tag} (resets {r7})")
+                     else f"session(5h) {p5}% used{r5}")
+    # One entry per weekly limit, in the cache's order (all models first, then
+    # each scoped one), so the assistant sees a scoped limit about to bind and
+    # not just the all-models figure. The reset is named once: every weekly
+    # window turns over together.
+    for i, r in enumerate(_weekly_rows(c)):
+        label, pct = f"week({_weekly_label(r)})", r["pct"]
+        when = _resets_clause(r.get("reset")) if i == 0 else ""
+        parts.append(f"{label} last-known {pct}% (NOT live)" if stale
+                     else f"{label} {pct}% used{when}")
     line = "[usage] " + " · ".join(parts)
     if stale:
         # Name the real cause from refresh()'s own outcome (captured above), not
@@ -1275,12 +1286,12 @@ def cmd_status(plain=False):
     # pad or truncate it, and either is broken by a stray escape it cannot see or
     # undo. Colour mode does the reverse and is fully self-contained: every span
     # closes itself, so the fragment can be dropped anywhere without leaking.
-    def seg(label, pct, reset_iso, unit, denom, window, cells):
+    def seg(label, pct, reset_iso, unit, denom, window, cells, countdown=True):
         pace = pace_for(reset_iso, window, age)
         bar = _bar(pct, cells=cells, pace=pace, ansi=not plain)
         pct_txt = f"{pct}%" if plain else f"{_color(pct)}{pct}%{RESET}"
         frag = f"{label} {bar} {pct_txt}"
-        if not stale:
+        if countdown and not stale:
             secs = _secs_until(reset_iso)
             if secs is not None and secs > 0:
                 # ceil to one decimal: a live countdown must never show 0.0
@@ -1293,9 +1304,13 @@ def cmd_status(plain=False):
     if p5 is not None:
         bits.append(seg("5h", p5, c.get("five_hour_reset"), "h", 360,
                         FIVE_HOUR_SECS, FIVE_HOUR_CELLS))
-    if p7 is not None:
-        bits.append(seg("7d", p7, c.get("seven_day_reset"), "d", 8640,
-                        SEVEN_DAY_SECS, SEVEN_DAY_CELLS))
+    # A gauge per weekly limit, in `/usage`'s order: `7d` for all models, then
+    # `7d·Fable` and so on for each scoped one, each with its own pace shadow.
+    # The countdown is drawn once, on the first — every weekly window turns
+    # over together, and the scoped gauges are the ones fighting for width.
+    for i, r in enumerate(_weekly_rows(c)):
+        bits.append(seg(_weekly_label(r), r["pct"], r.get("reset"), "d", 8640,
+                        SEVEN_DAY_SECS, SEVEN_DAY_CELLS, countdown=(i == 0)))
     if not bits:
         return
     # Always show the wall-clock time of the last successful read (e.g. "@17:52").
@@ -1386,16 +1401,11 @@ def cmd_show():
     except Exception:
         ansi = False
 
-    # One row per weekly limit the endpoint reported, all-models row first —
-    # the same list the 7d headline was chosen from, so the tightest one is
-    # always on it. A cache written before `weekly` existed carries only the
-    # headline; show that under its own label rather than blanking the row
-    # across the upgrade, and with no weekly data at all it is the "no data"
-    # row it always was.
-    weekly = [r for r in (c.get("weekly") or []) if isinstance(r, dict)]
-    if not weekly:
-        weekly = [{"label": c.get("seven_day_scope"), "pct": p7,
-                   "reset": c.get("seven_day_reset")}]
+    # One row per weekly limit the endpoint reported, all-models first — the
+    # same rows the status line draws. With no weekly data at all it is the
+    # "no data" row it always was.
+    weekly = _weekly_rows(c) or [{"label": None, "pct": p7,
+                                  "reset": c.get("seven_day_reset")}]
     labels = ["Session (5h)"] + [
         "Weekly (7d)" if r.get("label") is None else f"Weekly {r.get('label')}"
         for r in weekly]
@@ -1431,12 +1441,6 @@ def cmd_show():
     print(row(labels[0], p5, c.get("five_hour_reset"), FIVE_HOUR_SECS, FIVE_HOUR_CELLS))
     for label, r in zip(labels[1:], weekly):
         print(row(label, r.get("pct"), r.get("reset"), SEVEN_DAY_SECS, SEVEN_DAY_CELLS))
-    scope = c.get("seven_day_scope")
-    if isinstance(scope, str) and scope:
-        # The headline on the status line and in the hook is whichever row
-        # above is highest; say so when that isn't the all-models row, or a
-        # "7d 3%" beside a "Weekly (7d) 2%" reads as a disagreement.
-        print(f"  (7d on the status line = tightest weekly limit: {scope})")
     # Be honest when the forced refresh could NOT reach the endpoint: a live
     # `show` that silently returns hour-old cache is exactly how a stale 0% gets
     # mistaken for current. Flag the cache age and any active back-off.
