@@ -102,6 +102,10 @@ STALE_SECONDS = 1800     # mark the readout as stale (endpoint likely unreachabl
 ERROR_BACKOFF = TTL_SECONDS  # after a non-429 fetch failure, wait this long before retrying:
                          # a failed attempt writes no cache, so without it nothing advances the
                          # TTL clock and a synchronous caller retries (and blocks) every prompt
+KEYCHAIN_TIMEOUT = 5     # macOS only: bound on the Keychain read (see _read_cred_text). Short
+                         # because this sits on the hook's synchronous path and therefore on
+                         # your prompt latency; install.sh, where a human is by definition
+                         # present to answer an authorization dialog, waits longer.
 PACE_MAX_AGE = TTL_SECONDS   # drop the pace mark past this; see pace_for()
 FIVE_HOUR_SECS = 5 * 3600    # span of the session window — the denominator for its pace mark
 SEVEN_DAY_SECS = 7 * 86400   # ...and of the weekly window
@@ -248,6 +252,50 @@ def _tilde(path):
     return path
 
 
+def _read_cred_text():
+    """Return the credentials JSON as text, or None when there is none to read.
+
+    Linux and Windows keep the token in a file; macOS keeps it in the login
+    Keychain, where there is no file to open. The file is tried first on every
+    platform, so off Darwin this is the old behaviour and the `security` branch
+    is unreachable.
+    """
+    try:
+        with open(CRED, encoding="utf-8-sig") as fh:
+            return fh.read()
+    except Exception:
+        pass
+    if sys.platform == "darwin":
+        # Best-effort. A locked or ACL-denied Keychain reads as "no token",
+        # which every caller already degrades on.
+        try:
+            r = subprocess.run(
+                ["security", "find-generic-password",
+                 "-s", "Claude Code-credentials", "-w"],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                timeout=KEYCHAIN_TIMEOUT)
+            if r.returncode == 0 and r.stdout.strip():
+                return r.stdout.decode("utf-8", "replace")
+        except subprocess.TimeoutExpired:
+            # The item's ACL does not already trust `security`, so macOS raised
+            # an authorization dialog and nobody answered it inside the bound.
+            #
+            # Park the next attempt. The caller treats this as "no token" and
+            # returns without writing a cache, so nothing advances the TTL clock
+            # — and the next prompt would raise the same dialog and pay the same
+            # stall, every turn, forever. That is the precise loop ERROR_BACKOFF
+            # exists to stop; it is only reached here because a missing *file*
+            # is instant and cheap, whereas a missing *grant* is neither.
+            #
+            # Answering the dialog once (Always Allow) retires this for good,
+            # which is why ./install.sh gives the same read a longer window: an
+            # install is where a human is definitionally present to answer it.
+            set_error_backoff()
+        except Exception:
+            pass
+    return None
+
+
 def load_token():
     """Return (access_token, expires_at_seconds) or (None, None).
 
@@ -256,9 +304,11 @@ def load_token():
     misread any non-ASCII byte and reject a hand-editor's BOM. Non-dict JSON
     anywhere in the shape degrades to "no token" like every other defect here.
     """
+    raw = _read_cred_text()
+    if raw is None:
+        return None, None
     try:
-        with open(CRED, encoding="utf-8-sig") as fh:
-            data = json.load(fh)
+        data = json.loads(raw)
     except Exception:
         return None, None
     if not isinstance(data, dict):

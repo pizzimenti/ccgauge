@@ -457,26 +457,13 @@ else
   warn "claude CLI not on PATH — usage.py will fall back to its pinned User-Agent"
 fi
 
-# Platform. ccgauge reads the OAuth token straight off disk, and Claude Code only
-# keeps it there on Linux and Windows — on macOS it lives in the Keychain, so
-# there is no file for us to read and no amount of logging in will create one.
-# Say so plainly here rather than letting the credentials check further down
-# report a missing file and send you off to re-authenticate for nothing.
+# Platform. Where the OAuth token lives is the only thing that differs: Linux and
+# Windows keep it in a file, macOS in the login Keychain. creds_available() below
+# is the single place that knows the difference.
 PLATFORM="$(uname -s 2>/dev/null || echo unknown)"
 case "$PLATFORM" in
   Linux)  ok "platform: Linux" ;;
-  Darwin)
-    # Exit here, before touching anything. `fail` only increments a counter that
-    # is read at the very end, so using it would install all three files and
-    # replace the user's status line on a platform we have just declared
-    # unsupported — leaving behind a gauge that can never populate.
-    fail "platform: macOS — not supported"
-    printf '        Claude Code stores its OAuth token in the macOS Keychain, not in\n'
-    printf '        %s/.credentials.json, so ccgauge cannot read it.\n' "$CONFIG_DIR"
-    printf '        Reading the Keychain is not implemented.\n\n'
-    printf '\033[0;31mccgauge: nothing was installed or changed.\033[0m\n' >&2
-    exit 1
-    ;;
+  Darwin) ok "platform: macOS" ;;
   MINGW*|MSYS*|CYGWIN*)
     ok "platform: Windows (Git Bash)"
     warn "Claude Code runs hooks and the status line through Git Bash when it is"
@@ -485,6 +472,47 @@ case "$PLATFORM" in
     ;;
   *) warn "platform: $PLATFORM — untested; ccgauge is developed on Linux" ;;
 esac
+
+# Is an OAuth token reachable at all? On Linux and Windows this is exactly the
+# `-r .credentials.json` test it replaces and nothing else runs. On macOS there
+# is no such file — the token is in the login Keychain — so fall through to a
+# silent probe for it, guarded on $PLATFORM so `security` is never invoked off
+# Darwin. Best-effort by design: a locked or denied Keychain reads as "no
+# token", which is reported, never fatal.
+#
+# The macOS probe is bounded, and has to be. A Keychain item whose ACL does not
+# already trust `security` puts up an authorization dialog and blocks until it
+# is answered — which during an unattended install is never, and an installer
+# that hangs with no output is worse than one that reports no token. The bound
+# is spelled in python3 because stock macOS ships no timeout(1) (the one on the
+# developer's machine came from Homebrew coreutils, so reaching for it would
+# have worked there and hung on a clean Mac) and python3 is already a hard
+# prerequisite checked above.
+#
+# 30s, not the 5s usage.py uses for the same read. That asymmetry is the point:
+# usage.py runs on the hook's synchronous path, so its bound is your prompt
+# latency and must stay short. An install is the one moment a human is
+# definitionally present and watching, so it is the right place to spend real
+# seconds letting them answer the dialog — choosing Always Allow once retires it
+# for every later read.
+creds_available() {
+  [ -r "$CONFIG_DIR/.credentials.json" ] && return 0
+  if [ "$PLATFORM" = "Darwin" ]; then
+    python3 - >/dev/null 2>&1 <<'PY' && return 0
+import subprocess, sys
+try:
+    r = subprocess.run(
+        ["security", "find-generic-password",
+         "-s", "Claude Code-credentials", "-w"],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=30)
+except Exception:
+    # Timed out (child already killed by run()), or security is missing.
+    sys.exit(1)
+sys.exit(0 if r.returncode == 0 and r.stdout.strip() else 1)
+PY
+  fi
+  return 1
+}
 
 # --------------------------------------------------------------------------- #
 # install
@@ -1284,7 +1312,7 @@ printf '%s\n' "$settings_report"
 # whole install costs exactly one — against an endpoint that 429s hard when
 # polled too fast, "exactly one" is worth some awkward sequencing.
 show_out=""
-if [ "$CHECK_ONLY" -eq 0 ] && [ -r "$CONFIG_DIR/.credentials.json" ]; then
+if [ "$CHECK_ONLY" -eq 0 ] && creds_available; then
   show_out=$(python3 "$USAGE_DST" show 2>/dev/null || true)
 fi
 
@@ -1603,8 +1631,12 @@ fi
 
 # Credentials and the endpoint are best-effort: no network in a container, or a
 # logged-out CLI, is not a broken install. Report, don't fail.
-if [ ! -r "$CONFIG_DIR/.credentials.json" ]; then
-  warn "no $CONFIG_DIR/.credentials.json — log in with the claude CLI, then re-run"
+if ! creds_available; then
+  if [ "$PLATFORM" = "Darwin" ]; then
+    warn "no OAuth token in the login Keychain — log in with the claude CLI, then re-run"
+  else
+    warn "no $CONFIG_DIR/.credentials.json — log in with the claude CLI, then re-run"
+  fi
 elif [ "$CHECK_ONLY" -eq 1 ]; then
   ok "OAuth credentials readable"
   # --check makes no network call at all, so report the cache rather than fetch.

@@ -4,6 +4,70 @@ All notable changes to ccgauge are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); this project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.16.0] — 2026-09-04
+
+macOS is supported. It was never more than one missing token source.
+
+### Added
+
+- **macOS support, via the login Keychain.** Claude Code stores its OAuth token
+  in the Keychain there rather than in `~/.claude/.credentials.json`, and
+  `install.sh` refused to run rather than leave a gauge that could never
+  populate. The refusal was sound; the premise that the gauge *could* never
+  populate was not. The Keychain item holds byte-for-byte the same JSON the
+  file does — `claudeAiOauth.accessToken`, `expiresAt` in milliseconds — so
+  nothing about parsing, caching, or rendering had to change. `usage.py` grew
+  one helper, `_read_cred_text()`, which tries the file on every platform and
+  falls through to `security find-generic-password` only on Darwin. That call
+  sits on the fetch path, which `load_token()` reaches from exactly one place,
+  so a status-line repaint never pays for it.
+- **`creds_available()` in `install.sh`**, the one place that knows where a
+  token lives. Off Darwin it is the `-r .credentials.json` test it replaces and
+  nothing further runs; on macOS it probes the Keychain. It replaces the two
+  file-existence checks that gated the install-time cache warm and the final
+  credentials report — the latter of which would otherwise have told a
+  logged-in Mac user to go log in. The probe is bounded at 30s: a Keychain item
+  whose ACL does not already trust `security` raises an authorization dialog and
+  blocks until it is answered, which during an unattended install is never, and
+  an installer that hangs with no output is worse than one that reports no
+  token. The bound is spelled in python3 because stock macOS ships no
+  `timeout(1)`.
+
+### Behaviour on an unanswered Keychain dialog
+
+- **The two bounds differ on purpose, and a timeout parks the next attempt.**
+  `usage.py` bounds its Keychain read at 5s (`KEYCHAIN_TIMEOUT`) because that
+  read sits on the hook's synchronous path and is therefore your prompt latency;
+  `install.sh` waits 30s because an install is the one moment a human is
+  definitionally present to answer the dialog, and choosing Always Allow once
+  retires it for every later read. Left there, though, the short bound would
+  have been worse than no bound: the "no token" path writes no cache, so nothing
+  advances the TTL clock, and every following prompt would raise the same dialog
+  and pay the same 5s stall, forever. A Keychain *timeout* — as distinct from a
+  plain missing token — now arms `ERROR_BACKOFF`, the mechanism that already
+  exists for exactly this loop, so the dialog can reappear at most once per
+  10 minutes instead of once per turn. Scoped to the timeout alone, so a missing
+  credentials file on Linux or Windows retries as cheaply as it always has.
+
+### Changed
+
+- **The macOS platform gate is gone.** `install.sh` reports macOS the way it
+  reports Linux, and the README's platform table now lists it as supported. The
+  three test suites went from 6 ordering failures and a `--check` suite that
+  could not prime, to all 16 checks passing on macOS; the gate was the only
+  thing failing them.
+
+### Compatibility
+
+- **Nothing changes on Linux or Windows.** `json.load(fh)` became
+  `json.loads(fh.read())`, which is its definition, with the `utf-8-sig`
+  handling preserved. Verified by differencing the old and new `load_token()`
+  over 14 credential-file states (valid nested and flat, BOM, corrupt, non-dict,
+  bad `expiresAt`, empty, missing, unreadable, non-ASCII) under simulated Linux
+  and Windows: no differences. `install.sh --check` output is byte-identical
+  across Linux, Windows and an untested platform, logged in and out, and
+  `security` is never invoked off Darwin.
+
 ## [0.15.0] — 2026-09-04
 
 Every weekly limit gets its own gauge, in `/usage`'s order.
