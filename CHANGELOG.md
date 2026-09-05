@@ -4,6 +4,37 @@ All notable changes to ccgauge are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); this project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.15.0] — 2026-09-04
+
+Every weekly limit gets its own gauge, in `/usage`'s order.
+
+### Changed
+
+- **A gauge per weekly limit on the status line and in the hook line.**
+  `/usage` in-app lists the session, the all-models week and the model-scoped
+  week (Fable, as this ships) as three rows; ccgauge now draws the same three,
+  in that order, each with its own pace shadow: `5h`, `7d`, `7d·Fable`. The
+  scoped label is the payload's name, not ours, so it tracks whatever the
+  endpoint scopes to. The countdown is drawn once, on `7d` — every weekly
+  window turns over together, and the scoped gauges are the ones fighting for
+  width. `show` prints the same rows.
+- **`7d` means all models again.** 0.14.0 made the single `7d` figure the
+  tightest weekly limit, so a scoped limit running ahead could not hide behind
+  the all-models one. With the scoped limits drawn beside it that guard is
+  redundant, and a label that says `7d` should mean what it always meant.
+  `seven_day_*` in the cache is the all-models row (the first row, for a body
+  with no unscoped limit); `seven_day_scope` and the hook line's
+  `[Fable; all models 4%]` tag, both one release old, are gone.
+- **`fetch` log events carry every weekly row** (`weekly`), so the scoped
+  limits are on record too.
+
+### Fixed
+
+- **No more `(resets )` in the hook line.** An untouched session window comes
+  with no reset time at all, and the hook line printed the clause anyway with
+  nothing after it — on a line the assistant reads every turn. The clause is
+  now omitted when there is nothing to say, as `show` has done since 0.14.0.
+
 ## [0.14.0] — 2026-09-04
 
 The weekly gauge reads the endpoint's `limits` array, and shows the weekly

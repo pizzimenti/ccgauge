@@ -6,25 +6,25 @@ A fuel gauge for your Claude Max plan.
 Claude Code's `/usage` command shows — but continuously, in two places:
 
 - **On your status line**, as a live
-  `5h [█▒▒░░░░░░░] 11%(3.7h) · 7d [▒▒▒▒░░░░░░░░░░] 3%(5.2d) · @15:38` readout — a
-  progress bar per window with the percentage beside it, colour-coded,
+  `5h [█▒▒░░░░░░░] 11%(3.7h) · 7d [▒▒▒▒░░░░░░░░░░] 3%(5.2d) · 7d·Fable [█▒▒▒░░░░░░░░░░] 6% · @15:38`
+  readout — a progress bar per limit with the percentage beside it, colour-coded,
   a pace shadow showing whether you're ahead of or behind the window's refill
   rate, a countdown to each window's reset, and the time it was last refreshed.
 - **In the assistant's context**, injected each turn via a `UserPromptSubmit`
   hook, so Claude itself can warn you as you approach a limit.
 
-The `7d` figure is whichever weekly limit is *tightest* — the all-models limit
-or a model-scoped one — because that is the wall you hit first. The hook line
-names the scope when it isn't all-models (`week(7d) 6% used [Fable; all models
-4%]`), and `usage.py show` lists every weekly limit the endpoint reports.
+Every weekly limit the endpoint reports gets its own gauge, in `/usage`'s
+order — `7d` for all models, then one per model-scoped limit (`7d·Fable`) —
+each with its own pace shadow. The hook line and `usage.py show` list the same
+rows.
 
 It reads the OAuth token Claude Code already stores on disk, queries the
 (undocumented) usage endpoint, and caches the result. No API key, no password,
 no browser — and the token never leaves your machine.
 
 ```text
-~ ctx:10% Opus 4.8 (1M context) 5h [█▒▒░░░░░░░] 11%(3.7h) 7d [▒▒▒▒░░░░░░░░░░] 3%(5.2d)
-                                 └──────────────────────────────────────────────────┘ ccgauge
+~ ctx:10% Opus 4.8 (1M context) 5h [█▒▒░░░░░░░] 11%(3.7h) 7d [▒▒▒▒░░░░░░░░░░] 3%(5.2d) 7d·Fable [█▒▒▒░░░░░░░░░░] 6%
+                                 └───────────────────────────────────────────────────────────────────────────────┘ ccgauge
 ```
 
 ## Why
