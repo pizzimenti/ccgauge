@@ -543,26 +543,151 @@ def _http_get(token):
         return None, None, None
 
 
+def _round_pct(value):
+    """A raw percentage from the payload as a whole number, or None.
+
+    Rounds half away from zero, matching _cells(): the cache holds the number
+    the bar is drawn from, and Python's built-in `round` is ties-to-even, so a
+    2.5 landed on 2 while a 3.5 landed on 4. Percentages are never negative,
+    so floor(x + 0.5) is that rounding. Goes through _finite so a NaN or an
+    infinity — which `round` raises on, past any except clause for the usual
+    parse failures — reads as "no reading" rather than a blank gauge.
+    """
+    p = _finite(value)
+    return None if p is None else int(math.floor(p + 0.5))
+
+
 def _pct(window):
+    """A legacy per-window object's `utilization`, rounded (None if unusable)."""
     if not isinstance(window, dict):
         return None
-    u = window.get("utilization")
-    try:
-        return round(float(u))
-    except (TypeError, ValueError):
+    return _round_pct(window.get("utilization"))
+
+
+def _legacy(body, key):
+    """(pct, reset) from a legacy per-window object; (None, None) if unusable."""
+    win = body.get(key)
+    if not isinstance(win, dict):
+        return None, None
+    return _pct(win), win.get("resets_at")
+
+
+def _scope_label(row):
+    """What a scoped limit is scoped *to*, taken from the payload, not from code.
+
+    `scope.model.display_name` is whatever the endpoint calls the model today —
+    "Fable" as this is written, where the legacy key said "Opus" — so a new
+    model family arrives under its own name without a release. A surface
+    scope (no model) is labelled by the surface. A row with neither falls back
+    to its `kind` minus the `weekly_` prefix, so an unfamiliar kind is still
+    told apart from the all-models row rather than merged into it. None means
+    unscoped: all models.
+    """
+    kind = row.get("kind")
+    if kind == "weekly_all":
         return None
+    scope = row.get("scope")
+    if isinstance(scope, dict):
+        model = scope.get("model")
+        name = model.get("display_name") if isinstance(model, dict) else None
+        if isinstance(name, str) and name.strip():
+            return name.strip()
+        surface = scope.get("surface")
+        if isinstance(surface, dict):
+            surface = surface.get("display_name") or surface.get("id")
+        if isinstance(surface, str) and surface.strip():
+            return surface.strip()
+    if isinstance(kind, str) and kind.startswith("weekly_"):
+        kind = kind[len("weekly_"):]
+    return kind.strip() if isinstance(kind, str) and kind.strip() else "scoped"
+
+
+def _limits(body):
+    """The body's `limits` array as (session, weekly_rows).
+
+    `session` is (pct, reset) or None; `weekly_rows` is a list of
+    {"label", "pct", "reset"}, the all-models row first and scoped rows in
+    payload order. Rows are told apart by `group`/`kind`, never by position,
+    and a row without a usable percentage is dropped rather than carried as
+    "no data": a limit with nothing to say has no claim on a line of the
+    readout. A `limits` that isn't a list yields nothing, and the caller falls
+    back to the legacy keys.
+    """
+    rows = body.get("limits")
+    if not isinstance(rows, list):
+        return None, []
+    session, unscoped, scoped = None, [], []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        pct = _round_pct(row.get("percent"))
+        if pct is None:
+            continue
+        kind, group = row.get("kind"), row.get("group")
+        if kind == "session" or group == "session":
+            if session is None:
+                session = (pct, row.get("resets_at"))
+        elif group == "weekly" or (isinstance(kind, str) and kind.startswith("weekly")):
+            label = _scope_label(row)
+            entry = {"label": label, "pct": pct, "reset": row.get("resets_at")}
+            if label is None:
+                unscoped.append(entry)
+            else:
+                scoped.append(entry)
+    return session, unscoped[:1] + scoped
 
 
 def normalise(body):
-    out = {
-        "five_hour_pct": _pct(body.get("five_hour")),
-        "five_hour_reset": (body.get("five_hour") or {}).get("resets_at"),
-        "seven_day_pct": _pct(body.get("seven_day")),
-        "seven_day_reset": (body.get("seven_day") or {}).get("resets_at"),
-        "seven_day_opus_pct": _pct(body.get("seven_day_opus")),
+    """The endpoint's body as the cache record every reader serves from.
+
+    Two shapes are understood. The current one carries a `limits` array — a
+    row per enforced limit, tagged by `kind` (`session`, `weekly_all`,
+    `weekly_scoped`), a scoped row naming what it applies to. The legacy one
+    is a fixed object per window (`five_hour`, `seven_day`, `seven_day_opus`,
+    ...) — what the endpoint returned when ccgauge was written, and what it
+    still returns beside the array, except for the model-scoped windows, which
+    now exist only as rows. Per window the array wins and the legacy object
+    fills in only where the array has no row, so a body with both is never
+    counted twice.
+
+    The cache keys every reader depends on keep their names, but `seven_day_*`
+    now describes the *tightest* weekly limit — the highest percentage across
+    the all-models row and every scoped one — because that is the wall you hit
+    first, and a gauge showing the looser figure while a scoped limit ran
+    ahead would fail at the one thing it is for. `seven_day_scope` says which
+    (None for all models; a tie goes to all models, so a scope appears only
+    when it changes the reading) and `weekly` carries every row, for `show`.
+    """
+    body = body if isinstance(body, dict) else {}
+    session, weekly = _limits(body)
+    if session is None:
+        session = _legacy(body, "five_hour")
+    if not weekly:
+        for key, label in (("seven_day", None), ("seven_day_opus", "Opus"),
+                           ("seven_day_sonnet", "Sonnet")):
+            pct, reset = _legacy(body, key)
+            if pct is not None:
+                weekly.append({"label": label, "pct": pct, "reset": reset})
+    # Every weekly window turns over on the same cadence; a scoped row that
+    # came without a reset (the legacy objects never carried one) borrows the
+    # all-models row's, so its countdown and pace mark still draw.
+    shared = next((r["reset"] for r in weekly if r["label"] is None), None)
+    for r in weekly:
+        if r["reset"] is None:
+            r["reset"] = shared
+    tightest = None
+    for r in weekly:  # all-models leads, so a tie keeps the unscoped reading
+        if tightest is None or r["pct"] > tightest["pct"]:
+            tightest = r
+    return {
+        "five_hour_pct": session[0],
+        "five_hour_reset": session[1],
+        "seven_day_pct": tightest["pct"] if tightest else None,
+        "seven_day_reset": tightest["reset"] if tightest else None,
+        "seven_day_scope": tightest["label"] if tightest else None,
+        "weekly": weekly,
         "fetched_at": _now(),
     }
-    return out
 
 
 def read_cache():
@@ -636,6 +761,24 @@ def fmt_reset(iso):
         return "now"
     h, m = secs // 3600, (secs % 3600) // 60
     return f"in {h}h {m}m" if h else f"in {m}m"
+
+
+def _scope_tag(c):
+    """' [Fable; all models 2%]' when the cached 7d reading is a scoped limit.
+
+    Empty when it is the all-models reading, which needs no qualifying. The
+    all-models figure rides along so the reader can see whether the scoped
+    limit is the only thing that's tight; a bare "[Fable]" leaves the obvious
+    question — would another model have room? — unanswerable.
+    """
+    scope = c.get("seven_day_scope")
+    if not isinstance(scope, str) or not scope:
+        return ""
+    for r in c.get("weekly") or []:
+        if (isinstance(r, dict) and r.get("label") is None
+                and _finite(r.get("pct")) is not None):
+            return f" [{scope}; all models {r['pct']}%]"
+    return f" [{scope}]"
 
 
 def fmt_clock(epoch):
@@ -815,9 +958,19 @@ def refresh(force=False, outcome=None):
             else:
                 # only if the write landed: a "fetch" event means the cache (the
                 # single source of truth every reader serves from) really updated
+                #
+                # The resets travel with the percentages so the log can tell a
+                # window that turned over from a reading that merely fell: a
+                # weekly reset early, 37% one day and 2% the next, was
+                # indistinguishable from bad data without them. The scope says
+                # which weekly limit the 7d figure tracks when it isn't the
+                # all-models one (None, hence dropped, when it is).
                 log_event("fetch",
                           five_hour_pct=data.get("five_hour_pct"),
-                          seven_day_pct=data.get("seven_day_pct"))
+                          five_hour_reset=data.get("five_hour_reset"),
+                          seven_day_pct=data.get("seven_day_pct"),
+                          seven_day_reset=data.get("seven_day_reset"),
+                          seven_day_scope=data.get("seven_day_scope"))
             clear_cooldown()
             clear_error_backoff()
             _out("ok")
@@ -899,7 +1052,8 @@ def cmd_line():
     # real, and one bad field must not void the whole line.
     fa = c.get("fetched_at")
     age = int(_now() - fa) if isinstance(fa, (int, float)) else None
-    log_event("prompt", five_hour_pct=p5, seven_day_pct=p7, cache_age_s=age,
+    log_event("prompt", five_hour_pct=p5, seven_day_pct=p7,
+              seven_day_scope=c.get("seven_day_scope"), cache_age_s=age,
               cwd=cwd, session_id=session)
     stale = age is None or age > STALE_SECONDS
     parts = []
@@ -907,8 +1061,13 @@ def cmd_line():
         parts.append(f"session(5h) last-known {p5}% (NOT live)" if stale
                      else f"session(5h) {p5}% used (resets {r5})")
     if p7 is not None:
-        parts.append(f"week(7d) last-known {p7}% (NOT live)" if stale
-                     else f"week(7d) {p7}% used (resets {r7})")
+        # Name the limit when the 7d figure is a model-scoped one, with the
+        # all-models figure beside it: the assistant reading this line can then
+        # tell whether another model would have more room — which a bare
+        # percentage, however accurate, cannot say.
+        tag = _scope_tag(c)
+        parts.append(f"week(7d) last-known {p7}%{tag} (NOT live)" if stale
+                     else f"week(7d) {p7}% used{tag} (resets {r7})")
     line = "[usage] " + " · ".join(parts)
     if stale:
         # Name the real cause from refresh()'s own outcome (captured above), not
@@ -1227,7 +1386,29 @@ def cmd_show():
     except Exception:
         ansi = False
 
+    # One row per weekly limit the endpoint reported, all-models row first —
+    # the same list the 7d headline was chosen from, so the tightest one is
+    # always on it. A cache written before `weekly` existed carries only the
+    # headline; show that under its own label rather than blanking the row
+    # across the upgrade, and with no weekly data at all it is the "no data"
+    # row it always was.
+    weekly = [r for r in (c.get("weekly") or []) if isinstance(r, dict)]
+    if not weekly:
+        weekly = [{"label": c.get("seven_day_scope"), "pct": p7,
+                   "reset": c.get("seven_day_reset")}]
+    labels = ["Session (5h)"] + [
+        "Weekly (7d)" if r.get("label") is None else f"Weekly {r.get('label')}"
+        for r in weekly]
+    # Padded to a common width so the percentage column lines up: the rows are
+    # read against each other, which is the whole reason for listing them.
+    width = max(len(label) for label in labels)
+
     def row(label, pct, reset_iso, window, cells):
+        label = label.ljust(width)
+        # A reset we don't have is left unsaid rather than trailing off into
+        # "resets " and nothing.
+        when = fmt_reset(reset_iso)
+        when = f" — resets {when}" if when else ""
         if _finite(pct) is None:
             # No bar at all: _cells() coerces an unusable value to zero, so
             # drawing one would assert "nothing spent, all this headroom" about a
@@ -1235,10 +1416,9 @@ def cmd_show():
             # claims. Checked with _finite rather than `is None` so a malformed
             # cache holding a string or a NaN takes this path too, instead of
             # reaching the subtraction below and raising.
-            return f"  {label}: no data — resets {fmt_reset(reset_iso)}"
+            return f"  {label}: no data{when}"
         pace = pace_for(reset_iso, window, age)
-        line = (f"  {label}: {_bar(pct, cells=cells, pace=pace, ansi=ansi)} {pct}% used"
-                f" — resets {fmt_reset(reset_iso)}")
+        line = f"  {label}: {_bar(pct, cells=cells, pace=pace, ansi=ansi)} {pct}% used{when}"
         if pace is not None:
             gap = round(pct - pace)
             n = abs(gap)
@@ -1248,14 +1428,15 @@ def cmd_show():
         return line
 
     print("Claude subscription usage")
-    print(row("Session (5h)", p5, c.get("five_hour_reset"), FIVE_HOUR_SECS, FIVE_HOUR_CELLS))
-    print(row("Weekly  (7d)", p7, c.get("seven_day_reset"), SEVEN_DAY_SECS, SEVEN_DAY_CELLS))
-    opus = c.get("seven_day_opus_pct")
-    if opus is not None:
-        # Carries a bar too, pace-less (the payload has no reset for it), so the
-        # percentage column stays aligned with the two rows above — which is the
-        # whole reason the three labels are padded to a common width.
-        print(f"  Weekly Opus : {_bar(opus, cells=SEVEN_DAY_CELLS, ansi=ansi)} {opus}% used")
+    print(row(labels[0], p5, c.get("five_hour_reset"), FIVE_HOUR_SECS, FIVE_HOUR_CELLS))
+    for label, r in zip(labels[1:], weekly):
+        print(row(label, r.get("pct"), r.get("reset"), SEVEN_DAY_SECS, SEVEN_DAY_CELLS))
+    scope = c.get("seven_day_scope")
+    if isinstance(scope, str) and scope:
+        # The headline on the status line and in the hook is whichever row
+        # above is highest; say so when that isn't the all-models row, or a
+        # "7d 3%" beside a "Weekly (7d) 2%" reads as a disagreement.
+        print(f"  (7d on the status line = tightest weekly limit: {scope})")
     # Be honest when the forced refresh could NOT reach the endpoint: a live
     # `show` that silently returns hour-old cache is exactly how a stale 0% gets
     # mistaken for current. Flag the cache age and any active back-off.

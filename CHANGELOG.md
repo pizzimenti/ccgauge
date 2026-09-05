@@ -4,6 +4,53 @@ All notable changes to ccgauge are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); this project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.14.0] — 2026-09-04
+
+The weekly gauge reads the endpoint's `limits` array, and shows the weekly
+limit that will actually stop you.
+
+### Changed
+
+- **`7d` is the tightest weekly limit, not the all-models one.** The endpoint
+  now reports more than one weekly limit — an all-models limit and one scoped
+  to a model (Fable, as this ships) — and the two diverge. The status line,
+  the hook line and `show`'s headline follow whichever is highest, because
+  that is the wall you hit first; a gauge holding the looser figure while a
+  scoped limit ran ahead would fail at the one thing it is for. The hook line
+  names the scope when it isn't all-models, with the all-models figure beside
+  it (`week(7d) 6% used [Fable; all models 4%]`), so the assistant can tell
+  whether another model would have room. Ties go to all-models, so a scope
+  appears only when it changes the reading. The cache keys every reader
+  depends on keep their names; a cache written by 0.13.0 still renders.
+- **`show` lists every weekly limit.** One row per weekly limit the endpoint
+  reports, all-models first, each with its own pace mark, and a note saying
+  which one the status line's `7d` is tracking when it isn't the all-models
+  row. Replaces the `Weekly Opus` row, which had been silently blank since the
+  endpoint stopped populating `seven_day_opus` — the scoped weekly limit had
+  moved into the `limits` array, labelled by the payload, and nothing here
+  read it.
+- **Percentages round half away from zero.** `_pct` used Python's `round`,
+  which is ties-to-even (2.5 → 2, 3.5 → 4), while the bar's own rounding
+  deliberately is not; the number beside the bar is now rounded the way the
+  bar is. A NaN or infinite value reads as "no data" instead of raising past
+  the parse-failure handling.
+
+### Added
+
+- **`normalise()` reads the `limits` array first.** Rows are recognised by
+  `kind`/`group`, never by position, and a scoped row is labelled from
+  `scope.model.display_name` (falling back to the surface, then the kind), so
+  a new model family arrives under its own name without a release. The legacy
+  top-level objects (`five_hour`, `seven_day`, `seven_day_opus`,
+  `seven_day_sonnet`) remain a fallback for any window the array has no row
+  for, and never merge with it. Pinned by `tests/test_normalise.py` against a
+  real response captured 2026-09-04 — the function had no coverage, which is
+  how the endpoint's shape moved underneath it unnoticed.
+- **`fetch` log events record the reset timestamps**, and the 7d scope. A
+  weekly limit reset early — 37% one day, 2% three days later — was
+  indistinguishable in the log from bad data. Now the log can tell a window
+  that turned over from a reading that merely fell.
+
 ## [0.13.0] — 2026-08-03
 
 `--check`'s exit code now agrees with its own words. (0.12.0 is the Windows

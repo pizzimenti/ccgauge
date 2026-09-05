@@ -13,6 +13,11 @@ Claude Code's `/usage` command shows — but continuously, in two places:
 - **In the assistant's context**, injected each turn via a `UserPromptSubmit`
   hook, so Claude itself can warn you as you approach a limit.
 
+The `7d` figure is whichever weekly limit is *tightest* — the all-models limit
+or a model-scoped one — because that is the wall you hit first. The hook line
+names the scope when it isn't all-models (`week(7d) 6% used [Fable; all models
+4%]`), and `usage.py show` lists every weekly limit the endpoint reports.
+
 It reads the OAuth token Claude Code already stores on disk, queries the
 (undocumented) usage endpoint, and caches the result. No API key, no password,
 no browser — and the token never leaves your machine.
@@ -244,14 +249,27 @@ Three things make this work:
   the installed CLI (`claude --version`) at runtime, falling back to a pinned
   default if that can't be read — so it tracks Claude Code updates automatically.
 
-The response is small:
+The response has grown since ccgauge was written, and the part that matters
+now lives in a `limits` array — one row per enforced limit, tagged by `kind`
+and, for a model-scoped one, a `scope` naming the model:
 
 ```json
-{"five_hour": {"utilization": 11.0, "resets_at": "2026-06-23T...Z"},
- "seven_day": {"utilization": 3.0,  "resets_at": "2026-06-28T...Z"}}
+{"limits": [
+   {"kind": "session",       "percent": 16, "resets_at": "2026-09-05T...Z"},
+   {"kind": "weekly_all",    "percent": 2,  "resets_at": "2026-09-06T...Z"},
+   {"kind": "weekly_scoped", "percent": 3,  "resets_at": "2026-09-06T...Z",
+    "scope": {"model": {"display_name": "Fable"}}}],
+ "five_hour": {"utilization": 16.0, "resets_at": "2026-09-05T...Z"},
+ "seven_day": {"utilization": 2.0,  "resets_at": "2026-09-06T...Z"}}
 ```
 
-`utilization` is a 0–100 float. That's the whole contract.
+The top-level `five_hour`/`seven_day` objects are the legacy shape — still
+sent, still read as a fallback — but the model-scoped weekly limit exists only
+as a row (the old `seven_day_opus` key is now null). ccgauge takes the array
+first and the legacy objects only for a window the array has no row for, and
+it takes a scoped row's *label* from the payload, so a new model family shows
+up under its own name without a release. `tests/test_normalise.py` pins the
+shape against a real captured response.
 
 ### One writer, many readers
 
